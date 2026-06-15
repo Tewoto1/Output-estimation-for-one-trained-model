@@ -15,6 +15,7 @@ start here.
 | **Checkpoint NAMING & recycling** | `experiments.py` (`run_name`, `ckpt_path`, `get_or_train`) | `readout-frozen_identity_d2_w64_seed0_final.pt` |
 | **Checkpoint FOLDER + per-experiment knobs** | each notebook's config cell | `CKPT_DIR = "checkpoints/kprop_tol_checkpoints"`, `WIDTHS`, `LOSS_TOL` |
 | **Predictor (kprop) knobs** | `Mecha_preds/cumulants/adapter.py` | `k_max`, `exact_relu_cov` |
+| **Structured (spike-aware) kprop knobs** | `Mecha_preds/cumulants/skprop/adapter.py` | `n_nodes`, `q_max`, `margin`, `directions`, `deep`, `deep_directions` |
 | **Analysis tools** | `analysis/Tools/` | `weight_spectrum`, `weight_structure_metrics`, … |
 
 Rule of thumb: **`experiments.py` holds the classic defaults and the machinery
@@ -146,6 +147,14 @@ see §6 of the frozen-readout notebook.
 4. **New reusable metric?** Put it in `analysis/Tools/` and export it from
    `analysis/__init__.py` — never define a metric inline in a notebook if a second
    notebook might want it.
+5. **Spiked/meaned matrices breaking kprop?** Use structured power KPROP:
+   `from Mecha_preds.cumulants.skprop import run_structured_cumulants` — detects the
+   low-rank latent (or takes `directions=` explicitly, e.g. from `ΔW = W - W_init`),
+   conditions on Gauss–Hermite nodes, and runs the ordinary power-cumulant kprop per
+   node. With no spike detected (q=0) it returns EXACTLY the vanilla prediction, so
+   it is safe to use unconditionally. Validation + usage examples:
+   `colab_notebooks/structured_kprop/` (toy A/B/C/D scaling laws, planted-spike sweep,
+   trained-checkpoint study).
 
 ## 6. Gotchas
 

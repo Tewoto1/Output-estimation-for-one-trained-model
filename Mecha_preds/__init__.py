@@ -2,7 +2,12 @@
 
 A "mechanistic predictor" takes a trained ``model.MLP`` and predicts a statistic
 of its output (e.g. the output mean over Gaussian inputs) without Monte-Carlo
-sampling. For now the only predictor shipped here is cumulant propagation
-(``Mecha_preds.cumulants``), which also includes a variant that computes the
-second moment (the K=2 ReLU covariance) exactly.
+sampling. Predictors shipped here:
+
+  * ``Mecha_preds.cumulants``   -- cumulant propagation (kprop), incl. an exact
+        K=2 ReLU covariance variant, the spike-aware ``skprop`` and symbolic
+        ``shkprop`` sub-predictors.
+  * ``Mecha_preds.clippedProp`` -- structured propagation that carries the
+        all-ones (mean-shift) channel as an explicit clamped-Gaussian scalar plus
+        a perpendicular Gaussian; built for shifted-/clamped-mean inputs.
 """

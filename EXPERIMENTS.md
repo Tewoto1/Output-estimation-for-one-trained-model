@@ -123,6 +123,7 @@ no global registry):
 | `checkpoints/kprop_tol_checkpoints/` | kprop scaling notebook — train-to-tolerance regime (`_tol5` = MSE < 1e-5, d3, widths 16–2048) |
 | `checkpoints/shifted_mean_kprop/` | shifted-mean skprop notebook — random `W = W' + B` models (`B = -(1/√n)/-(1/n) 11ᵀ`, d3, widths 32–512) + a per-config `results_*.pt` cache of MC/kprop predictions (recycled, downloadable) |
 | `checkpoints/symbolic_hidden_mode_kprop/` | symbolic hidden-mode kprop notebook — square nets **trained to 0 with `loss_tol=1e-7`** (`shkprop-zero_d2_w{16..256}_seed{0,1,2}`) + a per-config `results_*.pt` cache of 40M-point MC / symbolic predictions (recycled, downloadable) |
+| `checkpoints/shifted_mean_vanilla_kprop/` | shifted-mean **vanilla-kprop scaling** notebook — random `W = W' − (1/√n)11ᵀ` models (`shifted-invsqrtn`, shift on **hidden** layers, **no training**), d3–5, widths 64–3072, seeds 1–2 + a per-config `results_*.pt` cache of MC/vanilla-kprop predictions (recycled, downloadable) |
 
 Checkpoints are self-describing `.pt` files: `model_config`, `state_dict`, `step`,
 `history`, `final_loss`, `train_config` (+ any `extra_meta`). Load with

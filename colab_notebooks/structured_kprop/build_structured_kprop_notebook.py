@@ -11,11 +11,13 @@ KPROP: spike-aware cumulant propagation for meaned/spiked matrices. Three tests:
       where vanilla kprop k=2 fails by O(1). structured_mlp_kprop must fix it
       (error to ~MC noise), for square AND relu activations; plus quadrature-node
       convergence and the m(h) latent-response diagnostic.
-  T3 (trained checkpoints, RECYCLED -- no retraining): the kprop-zero d3 tol5
-      checkpoints. Auto-detection finds only MARGINAL spikes in the raw trained
-      weights (overshoot ~1.1) => structured degenerates to vanilla (by design,
-      q=0 is exactly vanilla). The notebook measures this honestly and probes the
-      DeltaW = W - W_init directions and deep mode as alternatives.
+  T3 (trained-to-tolerance checkpoints, LOAD-OR-TRAIN): the kprop-zero d3 tol6
+      checkpoints, trained to MSE < 1e-6 (early stopping) -- all seeds of a width
+      together in ONE vmapped parallel loop (E.get_or_train_many), loaded from disk
+      if already present. Auto-detection finds only MARGINAL spikes in the raw
+      trained weights (overshoot ~1.1) => structured degenerates to vanilla (by
+      design, q=0 is exactly vanilla). The notebook measures this honestly and probes
+      the DeltaW = W - W_init directions and deep mode as alternatives.
 
 Sandbox pre-run results baked into the markdown (sanity anchors, CPU float64):
   toy slopes A/B/C: -0.05 / -1.03 / -2.02, D exact;
@@ -59,7 +61,7 @@ $$\text{amplitude error} \le C\left(n^{-k_{\max}/2} + \text{quadrature} + E_{\ma
 |---|---|---|---|
 | **T1** | closed-form toy ($P_i = a_iH+\sigma G_i$, $\phi=z^2$, cubic readout) | err(A)=$O(1)$, err(B)=$O(1/n)$, err(C)=$O(1/n^2)$, D exact | §2 |
 | **T2** | planted rank-1 spike $s=\sqrt{n}$ in a random MLP | vanilla k=2 fails by $O(1)$; structured ≈ MC noise | §3–4 |
-| **T3** | trained kprop-zero d3 tol5 checkpoints (recycled) | measure honestly: is the trained failure the coherent-latent mode? | §5 |
+| **T3** | trained-to-tol6 kprop-zero d3 checkpoints (load-or-train, parallel) | measure honestly: is the trained failure the coherent-latent mode? | §5 |
 
 Sandbox anchors (CPU, float64): T1 slopes $-0.05/-1.03/-2.02$; T2 (square, $n{=}256$)
 vanilla rel-err **2.1** → structured **6.4e-3**; T3 raw-weight spikes are *marginal*
@@ -95,12 +97,27 @@ SYN_MC        = 200_000 if QUICK else 1_000_000
 N_NODES       = 15                    # Gauss-Hermite nodes (input latent)
 NODE_SWEEP    = [3, 5, 7, 9, 11, 15, 21, 31]
 
-# ---- T3 trained checkpoints (RECYCLED; the repo rule: never retrain) ----
-CKPT_DIR      = "checkpoints/kprop_checkpoints"   # kprop-zero_d3_w{w}_tol5_seed{s}_final.pt
+# ---- T3 trained checkpoints: TRAIN-TO-TOLERANCE 1e-6, recycled (parallel) ----
+# This notebook OWNS its checkpoints. For each width, ALL seeds train
+# SIMULTANEOUSLY in one vmapped loop (E.get_or_train_many -> training/parallel.py,
+# ~Nx faster than sequential on GPU) and are saved under CKPT_DIR, so a re-run (or a
+# crashed Colab session) LOADS instead of retraining. Early stopping: each model
+# trains until its per-step MSE has STABILIZED below LOSS_TOL (the repo train-to-zero
+# regime); the tolerance exponent is baked into the run name (tol6 = 1e-6) so changing
+# LOSS_TOL never silently reuses models trained under a different tolerance.
+CKPT_DIR      = "checkpoints/structured_kprop_tol_checkpoints"
 CKPT_WIDTHS   = [16, 32, 64, 128] if QUICK else [16, 32, 64, 128, 256, 512, 1024]
 CKPT_SEEDS    = [3] if QUICK else [3, 4, 5, 6]
 CKPT_MC       = 200_000 if QUICK else 400_000
 K_MAX         = 2                     # deep mode requires 2
+
+LOSS_TOL        = 1e-6                # EARLY STOPPING: train until per-step MSE < 1e-6
+TOL_TAG         = int(round(-math.log10(LOSS_TOL)))   # 1e-6 -> 6, goes into the run name
+CKPT_MAX_STEPS  = 200_000             # safety cap only; a run that hits it did NOT converge
+TOL_CHECK_EVERY = 1                   # check the stop criterion every step (fast convergence)
+TOL_PATIENCE    = 25                  # stop after MSE has been < LOSS_TOL this many CONSECUTIVE steps
+CKPT_LR         = 1e-4                # gentle LR so the loss GLIDES into the tolerance
+CKPT_BATCH      = 1024
 
 from Mecha_preds.cumulants import run_cumulants
 from Mecha_preds.cumulants.kprop import MLP as KpropMLP, mlp_kprop
@@ -108,7 +125,10 @@ from Mecha_preds.cumulants.skprop import (
     detect_spikes, detect_spikes_all_layers, structured_mlp_kprop,
     run_structured_cumulants, make_toy, error_sweep,
 )
+from tasks import ZeroTask              # T3 trains its own checkpoints to tolerance
+from training import TrainConfig
 print("QUICK:", QUICK)
+print(f"T3 train-to-tol: MSE < {LOSS_TOL:g} (cap {CKPT_MAX_STEPS}) | ckpts -> {CKPT_DIR}")
 """)
 
 code(r"""
@@ -255,9 +275,14 @@ ax2.legend(); ax2.grid(alpha=0.3); plt.tight_layout(); plt.show()
 """)
 
 # =============================================================================
-md(r"""## 5. T3 — trained checkpoints (recycled): is the tol5 failure the coherent-latent mode?
+md(r"""## 5. T3 — trained-to-tolerance checkpoints: is the tol6 failure the coherent-latent mode?
 
-Loads the existing `kprop-zero_d3_w*_tol5_seed*` checkpoints — **no retraining**.
+**Load-or-train (repo recycling rule).** `kprop-zero_d3_w*_tol6_seed*` checkpoints are
+loaded from disk if present; any missing seed is trained — all seeds of a width together
+in **one vmapped parallel loop** (`E.get_or_train_many` → `training/parallel.py`) — with
+**early stopping at MSE < `1e-6`** (`loss_tol=LOSS_TOL`, per-step checks, `tol_patience`).
+A re-run recycles instead of retraining; a run that hits the step cap is flagged NOT CONVERGED.
+
 Three structured variants vs vanilla, all k=2:
 auto-detected first-layer spike (`q_max=1`), input directions from
 $\Delta W_0 = W_0 - W_0^{init}$ (init rebuilt from the checkpoint seed), and **deep mode
@@ -265,28 +290,54 @@ with channels from $\Delta W_{1,2}$** (their spikes have overshoot 20–30× but
 by the random bulk in the raw $W$, so raw-W detection misses them; conditional-CLT
 approximation).
 
-Sandbox pre-run (seed 3): raw-weight spikes are **marginal** (overshoot ≲ 1.1 ⇒ q=0 at the
+Sandbox pre-run (seed 3, observed at tol5; the tol6 picture is qualitatively the same):
+raw-weight spikes are **marginal** (overshoot ≲ 1.1 ⇒ q=0 at the
 default margin ⇒ structured ≡ vanilla, verifying the degenerate path). $\Delta W$-deep
 conditioning DID help at small width (w16: 0.96→0.64, w32: 0.64→0.41 rel err) but converges
-to vanilla by w64–256. If that replicates across seeds, the honest conclusion: the tol5
+to vanilla by w64–256. If that replicates across seeds, the honest conclusion: the tol6
 trained-net failure at moderate/large widths is dominated by the OTHER failure mode
 (dead-ReLU point-mass marginals / $E_{\mathrm{condCLT}}$), not by a strong coherent latent —
 the planted-spike regime of §3 is where structure tracking is decisive.""")
 code(r"""
 from model import MLP
 
+# Build the kprop-zero study model: SQUARE d3 MLP, ReLU, no bias, with
+# input_dim == hidden_dim == output_dim == width (the structured-kprop convention).
+# Identical config => same seed reproduces the SAME init, so the DeltaW = W - W_init
+# diagnostics below compare each trained net to its own starting point.
+def build_ckpt_model(w, seed, device=None, dtype=None):
+    return E.build_mlp(w, 3, output_dim=w, seed=seed, device=device, dtype=dtype)
+
 results = []
 for w in CKPT_WIDTHS:
-    for seed in CKPT_SEEDS:
-        path = E.ckpt_path(CKPT_DIR, f"kprop-zero_d3_w{w}_tol5_seed{seed}")
-        import os as _os
-        if not _os.path.exists(path):
-            print("missing (skipped):", path); continue
-        m, payload = MLP.load(path, map_location="cpu"); m = m.double().eval()
+    # LOAD-OR-TRAIN, per the repo recycling rule. E.get_or_train_many LOADS every
+    # checkpoint that already exists on disk and trains ONLY the missing seeds --
+    # and those missing ones train together in ONE vmapped parallel loop
+    # (training/parallel.py), early-stopping at MSE < 1e-6. Re-running this cell
+    # (or resuming a dead Colab session) recycles instead of retraining.
+    paths  = [E.ckpt_path(CKPT_DIR, E.run_name("kprop-zero", depth=3, width=w,
+                                               tol=TOL_TAG, seed=s)) for s in CKPT_SEEDS]
+    builds = [(lambda s=s: build_ckpt_model(w, s, device=E.DEVICE, dtype=torch.float32))
+              for s in CKPT_SEEDS]
+    tcfg   = TrainConfig(steps=CKPT_MAX_STEPS, batch_size=CKPT_BATCH, lr=CKPT_LR,
+                         optimizer="adamw", loss_tol=LOSS_TOL, tol_check_every=TOL_CHECK_EVERY,
+                         tol_patience=TOL_PATIENCE, checkpoint_mode="final", log_every=50,
+                         device=str(E.DEVICE), dtype="float32")
+    trained = E.get_or_train_many(paths, builds,
+                                  task=ZeroTask(input_dim=w, output_dim=w),
+                                  train_cfg=tcfg, extra_meta={"experiment": "structured_kprop_tol_scaling"},
+                                  map_location="cpu", progress=True)
+    for seed, (m, payload, loaded) in zip(CKPT_SEEDS, trained):
+        fl = E.final_loss(payload)
+        conv = "" if (math.isnan(fl) or fl <= LOSS_TOL) else " *** NOT CONVERGED (hit step cap) ***"
+        print(f"w={w:>5} seed={seed} tol1e-{TOL_TAG}: "
+              f"{'[loaded]' if loaded else '[trained]'} loss={fl:.2e}{conv}", flush=True)
+
+        m = m.to(device="cpu", dtype=torch.float64).eval()   # cpu float64 for the analysis paths
         mc, se = mc_mean(m, m.cfg.input_dim, CKPT_MC)
         van = run_cumulants(m, config={"k_max": K_MAX, "factor": False})["mean"]
         s_auto = run_structured_cumulants(m, config={"k_max": K_MAX, "n_nodes": N_NODES, "q_max": 1})
-        init = E.build_mlp(w, 3, output_dim=m.cfg.output_dim, seed=m.cfg.seed).double()
+        init = build_ckpt_model(w, seed).double()
         dW0 = (m.hidden_layers[0].weight - init.hidden_layers[0].weight).detach()
         spk = detect_spikes(dW0, q_max=2, margin=1.15)
         s_dw = run_structured_cumulants(m, config={"k_max": K_MAX, "n_nodes": N_NODES,
@@ -328,14 +379,15 @@ for key, lab, fmt in [("van", "vanilla k=2", "o-"), ("auto", "structured (auto)"
                       ("dw0", "structured (dW0 dirs)", "^-"), ("deep", "structured (deep)", "v:")]:
     ax.loglog(ws, [np.mean([r[key] for r in by_w[w]]) for w in ws], fmt, label=lab)
 ax.set_xlabel("width"); ax.set_ylabel("relative L2 error of E[out]")
-ax.set_title("trained kprop-zero d3 tol5 checkpoints (mean over seeds)")
+ax.set_title(f"trained kprop-zero d3 tol{TOL_TAG} checkpoints (mean over seeds)")
 ax.legend(); ax.grid(alpha=0.3); plt.tight_layout(); plt.show()
 
 # layer-wise spike diagnostics on W and DeltaW
 w_diag = CKPT_WIDTHS[-1]
-m, _ = MLP.load(E.ckpt_path(CKPT_DIR, f"kprop-zero_d3_w{w_diag}_tol5_seed{CKPT_SEEDS[0]}"),
+m, _ = MLP.load(E.ckpt_path(CKPT_DIR, E.run_name("kprop-zero", depth=3, width=w_diag,
+                                                 tol=TOL_TAG, seed=CKPT_SEEDS[0])),
                 map_location="cpu")
-init = E.build_mlp(w_diag, 3, output_dim=m.cfg.output_dim, seed=m.cfg.seed)
+init = build_ckpt_model(w_diag, m.cfg.seed)
 Ws = [l.weight.double() for l in m.hidden_layers] + [m.readout.weight.double()]
 dWs = [(l.weight - i.weight).double() for l, i in zip(m.hidden_layers, init.hidden_layers)]
 print(f"\nw={w_diag} spike overshoot (top sv / MP edge):")
@@ -355,12 +407,12 @@ md(r"""## 6. Summary
   ($a_i = O(1)$ loadings); `structured_mlp_kprop` recovers the MC answer to the noise floor
   at ~15 quadrature nodes, for both polynomial and ReLU activations. The $m(h)$ panel shows
   exactly what a single-Gaussian state cannot represent.
-- **T3 (trained tol5 checkpoints):** auto-detection finds only marginal structure in the RAW
+- **T3 (trained-to-1e-6 checkpoints):** auto-detection finds only marginal structure in the RAW
   trained weights (structured == vanilla *by construction*, q=0) — but $\Delta W$ hides
   strong low-rank structure (overshoot 20–30×), and conditioning on those channels (deep
   mode) cuts the error substantially at small widths (w16: 0.96→0.64, w32: 0.64→0.41)
   while converging to vanilla by w64+. So the coherent-latent mode is real but subdominant
-  in the trained tol5 regime at width — consistent with the dead-ReLU/marginal-
+  in the trained tol6 regime at width — consistent with the dead-ReLU/marginal-
   non-Gaussianity chain from the failure-analysis notebook being the main culprit there.
   The structured algorithm is decisive when the spike is strong (T2) and safe to leave ON
   otherwise (it degenerates to vanilla); the marginal failure mode needs a different fix

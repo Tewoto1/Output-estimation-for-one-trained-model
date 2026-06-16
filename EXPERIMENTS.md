@@ -16,6 +16,7 @@ start here.
 | **Checkpoint FOLDER + per-experiment knobs** | each notebook's config cell | `CKPT_DIR = "checkpoints/kprop_tol_checkpoints"`, `WIDTHS`, `LOSS_TOL` |
 | **Predictor (kprop) knobs** | `Mecha_preds/cumulants/adapter.py` | `k_max`, `exact_relu_cov` |
 | **Structured (spike-aware) kprop knobs** | `Mecha_preds/cumulants/skprop/adapter.py` | `n_nodes`, `q_max`, `margin`, `directions`, `deep`, `deep_directions` |
+| **Symbolic hidden-mode kprop knobs** | `Mecha_preds/cumulants/shkprop/adapter.py` | `latent`, `direction`, `hidden_degree_initial`, `hidden_degree_max`, `hidden_tail_tol`, `full_covariance` |
 | **Analysis tools** | `analysis/Tools/` | `weight_spectrum`, `weight_structure_metrics`, … |
 
 Rule of thumb: **`experiments.py` holds the classic defaults and the machinery
@@ -120,6 +121,8 @@ no global registry):
 | `checkpoints/noiseless_Layerless/` | frozen-readout notebook — frozen/trainable readout (d2 width sweep) + meanfield grids |
 | `checkpoints/weight_analysis_checkpoints/` | mech-interp notebook — halfspace / max / zerobias dissection models |
 | `checkpoints/kprop_tol_checkpoints/` | kprop scaling notebook — train-to-tolerance regime (`_tol5` = MSE < 1e-5, d3, widths 16–2048) |
+| `checkpoints/shifted_mean_kprop/` | shifted-mean skprop notebook — random `W = W' + B` models (`B = -(1/√n)/-(1/n) 11ᵀ`, d3, widths 32–512) + a per-config `results_*.pt` cache of MC/kprop predictions (recycled, downloadable) |
+| `checkpoints/symbolic_hidden_mode_kprop/` | symbolic hidden-mode kprop notebook — square nets **trained to 0 with `loss_tol=1e-7`** (`shkprop-zero_d2_w{16..256}_seed{0,1,2}`) + a per-config `results_*.pt` cache of 40M-point MC / symbolic predictions (recycled, downloadable) |
 
 Checkpoints are self-describing `.pt` files: `model_config`, `state_dict`, `step`,
 `history`, `final_loss`, `train_config` (+ any `extra_meta`). Load with
@@ -155,6 +158,13 @@ see §6 of the frozen-readout notebook.
    it is safe to use unconditionally. Validation + usage examples:
    `colab_notebooks/structured_kprop/` (toy A/B/C/D scaling laws, planted-spike sweep,
    trained-checkpoint study).
+6. **Want the hidden mode resolved without running N quadrature nodes?** Use symbolic
+   hidden-mode KPROP: `from Mecha_preds.cumulants.shkprop import run_symbolic_cumulants`
+   — carries the scalar latent `h` as polynomial jets (`config={"latent": "ones"}` for
+   `h = 1ᵀX/√n`, `"none"` for q=0 = ordinary k=2 kprop), exact on linear layers, ReLU
+   residual-Gaussian closure only. Torch-only (no kprop/scipy dependency); ships a numpy
+   oracle (`shkprop.reference`) the notebook cross-checks against. Validation + the
+   trained-to-0 (1e-7, 40M-MC) sweep: `colab_notebooks/symbolic_hidden_mode_kprop/`.
 
 ## 6. Gotchas
 

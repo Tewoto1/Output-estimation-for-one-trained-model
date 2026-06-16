@@ -41,3 +41,8 @@ __all__ = [
 # Structured power KPROP (spike-aware: latent conditioning + power-cumulant
 # residual) lives in ``.skprop`` -- import from there to keep this namespace
 # stable:  from Mecha_preds.cumulants.skprop import run_structured_cumulants
+#
+# Symbolic hidden-mode KPROP (the hidden mode carried symbolically as polynomial
+# jets instead of averaged over quadrature nodes; scalar h, k_max=2) lives in
+# ``.shkprop`` -- it has NO kprop dependency (torch+numpy only), so import it
+# directly:  from Mecha_preds.cumulants.shkprop import run_symbolic_cumulants

@@ -81,9 +81,28 @@ import torch
 
 import experiments as E
 from model import MLP
-from analysis.Tools.cumulants_sv import (
-    reduce_sv, stream_collective_coordinates, AB_REPORT,
-    predicted_slope_literal, predicted_slope_heuristic, fit_loglog_slope)
+
+# Robust import of the cumulant tools. Preferred path is the package
+# (analysis/Tools/__init__.py must use a RELATIVE `from . import cumulants_sv`,
+# never a bare `import cumulants_sv`, or the whole analysis package fails to
+# import). Fall back to loading the module directly by file path so a stale
+# clone / partial checkout still runs.
+try:
+    from analysis.Tools.cumulants_sv import (
+        reduce_sv, stream_collective_coordinates, AB_REPORT,
+        predicted_slope_literal, predicted_slope_heuristic, fit_loglog_slope)
+except Exception as _e:
+    import importlib.util as _ilu
+    _csv_path = os.path.join(REPO, "analysis", "Tools", "cumulants_sv.py")
+    _spec = _ilu.spec_from_file_location("cumulants_sv", _csv_path)
+    _csv = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_csv)
+    reduce_sv = _csv.reduce_sv
+    stream_collective_coordinates = _csv.stream_collective_coordinates
+    AB_REPORT = _csv.AB_REPORT
+    predicted_slope_literal = _csv.predicted_slope_literal
+    predicted_slope_heuristic = _csv.predicted_slope_heuristic
+    fit_loglog_slope = _csv.fit_loglog_slope
+    print("cumulants_sv: loaded directly by file path (package import failed:", repr(_e), ")")
 
 DEVICE      = E.DEVICE
 MODEL_DTYPE = torch.float32

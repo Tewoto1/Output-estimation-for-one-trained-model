@@ -22,6 +22,10 @@ from .Tools.weight_structure import (
     mean_prev_post, weight_structure_metrics, W_last, W_first,
     layer_stats, grad_flow,
 )
+from .Tools.cumulants_sv import (
+    reduce_sv, stream_collective_coordinates, AB_REPORT,
+    predicted_slope_literal, predicted_slope_heuristic, fit_loglog_slope,
+)
 
 __all__ = [
     "collect_activations", "run_with_intervention",
@@ -30,5 +34,7 @@ __all__ = [
     "activation_patch",
     "direct_contributions", "output_lens",
     "mean_prev_post", "weight_structure_metrics", "W_last", "W_first",
-    "layer_stats", "grad_flow", "cumulants_sv"
+    "layer_stats", "grad_flow", "cumulants_sv",
+    "reduce_sv", "stream_collective_coordinates", "AB_REPORT",
+    "predicted_slope_literal", "predicted_slope_heuristic", "fit_loglog_slope",
 ]

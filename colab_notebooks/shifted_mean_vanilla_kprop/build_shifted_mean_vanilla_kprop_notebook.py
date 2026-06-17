@@ -89,7 +89,8 @@ width to 3072 ($k{=}2$ is the $n\times n$ covariance; $k{\ge}3$ is an $n^3$ tens
 |---|---|---|
 | **§2** | actual unscaled $\lVert E[\text{out}]\rVert$ (MC vs $k{=}1$ vs $k{=}2$) **beside** the scaled rel-$L_2$ error | does $k{=}1$ even track the collapsed magnitude? how far is each from MC? |
 | **§3** | per-coordinate parity ($k{=}1$ & $k{=}2$ vs MC) + magnitudes table | are the points on $y=x$, or does mean-prop sit off-axis? $k{=}2$ vs $k{=}1$ gap |
-| **§4** | fit $\text{error}\propto n^{\,p}$, per predictor | does either error shrink with width, or stay $O(1)$? how much does covariance buy? |
+| **§4** | **cumulant fidelity, layer by layer** — propagated $\kappa_1$ (mean) & $\kappa_2$ (covariance) vs MC, **exact** vs vanilla $k{=}2$ | is exact $k{=}2$ accurate on the cumulants? *where* do they drift; does exact track the off-diagonal? |
+| **§5** | fit $\text{error}\propto n^{\,p}$, per predictor | does either error shrink with width, or stay $O(1)$? how much does covariance buy? |
 
 Needs Python ≥ 3.12 *or* the skprop kprop-compat shim (auto-active on import), plus torch.""")
 
@@ -353,7 +354,166 @@ print(f"\nrep d{D0} w{W0} s{S0}:  ||mu_MC|| = {np.linalg.norm(mc_v):.4e}   "
 """)
 
 # =============================================================================
-md(r"""## §4 — How does the error scale? Fit $\text{error}\propto n^{\,p}$, per predictor
+md(r"""## §4 — Cumulant fidelity, layer by layer: do the propagated cumulants match the actual ones?
+
+The sweep above only scores the **final output mean**. Here we open the box: kprop's `mlp_kprop` has a
+debug path, `output_all=True`, that returns the **cumulant tower at every layer** (`pre{l}` after each
+linear step, `act{l}` after each ReLU). We read off the predicted $\kappa_1$ (mean) and $\kappa_2$
+(covariance) and compare them, **layer by layer**, to Monte-Carlo estimates of the *actual* activation
+mean & covariance — so we see *where* the prediction drifts and whether **exact-ReLU-cov $k{=}2$** keeps
+the cumulants accurate.
+
+- **mean ($\kappa_1$):** compared for all three — mean-prop ($k{=}1$), vanilla ($k{=}2$), exact-cov ($k{=}2$).
+- **covariance ($\kappa_2$):** compared for the two $k{=}2$ variants, split into the **diagonal** (per-neuron
+  variance) and the **off-diagonal** — the off-diagonal is exactly what `exact_relu_cov` computes exactly,
+  so it is the decisive test. *(k=1's degree-2 is only a fixed $\mathrm{diag}(WW^\top)$ metric, not a
+  predicted covariance, so we don't score its $\kappa_2$.)*
+- **"kept to a similar rate":** alongside the errors we print the **magnitude ratios** $\lVert\kappa^{\text{pred}}\rVert/\lVert\kappa^{\text{MC}}\rVert$;
+  a ratio that stays $O(1)$ across layers means the cumulant is tracked at the right scale, a ratio that
+  collapses/explodes flags where the single-Gaussian state stops matching the (non-Gaussian) truth.
+
+Representative depth `CUMULANT_DEPTH` over a few **small** widths (a full $n\times n$ covariance needs a
+modest $n$ + enough MC samples). Exact-cov is scipy/CPU here.""")
+code(r"""
+from collections import OrderedDict
+from Mecha_preds.cumulants.kprop import mlp_kprop as _mlp_kprop, Kind as _Kind
+from Mecha_preds.cumulants.adapter import model_to_kprop as _model_to_kprop
+
+# ---- knobs for THIS section (full covariance -> keep widths modest) ----
+CUMULANT_DEPTH  = max(DEPTHS)
+CUMULANT_WIDTHS = [32, 64] if QUICK else [64, 128, 256]
+CUMULANT_MC     = 200_000 if QUICK else 1_000_000
+CUM_SEED        = SEEDS[0]
+CUM_BATCH       = min(MC_BATCH, 8192)
+
+def kprop_layer_cumulants(m, k_max, exact=False):
+    "Per-layer kprop cumulants via output_all=True -> {layer_key: (mean (n,), cov (n,n) or None)}."
+    n = m.cfg.input_dim
+    kmlp = _model_to_kprop(m, device="cpu")                       # float64 kprop copy of the SAME weights
+    K_in = {1: torch.zeros(n, dtype=torch.float64), 2: torch.eye(n, dtype=torch.float64)}
+    K_by = _mlp_kprop(kmlp, K_in, k_max=k_max, kind=_Kind.SIMPLE, use_avg_metric=False, factor=False,
+                      use_pK=True, output_all=True, output_d_max=2, exact_relu_cov=exact)
+    out = OrderedDict()
+    for key, K in K_by.items():
+        mean = K[1].to_tensor().double().cpu().numpy().reshape(-1)
+        cov = K[2].to_tensor().double().cpu().numpy() if (k_max >= 2 and 2 in K) else None
+        out[key] = (mean, cov)
+    return out
+
+@torch.no_grad()
+def mc_layer_cumulants(m, n, num_samples, batch, device, dtype):
+    "Streaming-MC mean + covariance of EVERY pre/post activation and the output, keyed like kprop."
+    depth = m.cfg.depth
+    md = copy.deepcopy(m).to(device=device, dtype=dtype).eval()
+    keys = [f"pre{l}" for l in range(depth)] + [f"act{l}" for l in range(depth)] + [f"pre{depth}"]
+    s1 = {k: torch.zeros(n, dtype=torch.float64, device=device) for k in keys}
+    s2 = {k: torch.zeros(n, n, dtype=torch.float64, device=device) for k in keys}
+    N = 0
+    while N < num_samples:
+        b = min(batch, num_samples - N)
+        acts = md.activations(torch.randn(b, n, device=device, dtype=dtype))
+        tens = {f"pre{l}": acts["pre"][l] for l in range(depth)}
+        tens.update({f"act{l}": acts["post"][l] for l in range(depth)})
+        tens[f"pre{depth}"] = acts["output"]
+        for k, t in tens.items():
+            t = t.double(); s1[k] += t.sum(0); s2[k] += t.T @ t
+        N += b
+    out = OrderedDict()
+    for k in keys:
+        mu = s1[k] / N
+        out[k] = (mu.cpu().numpy(), (s2[k] / N - torch.outer(mu, mu)).cpu().numpy())
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return out
+
+def cumulant_errors(pred_mean, pred_cov, mc_mean, mc_cov):
+    "rel errors + magnitude ratios for kappa_1 (mean) and (if predicted) kappa_2 (covariance)."
+    eps = 1e-30
+    d = dict(mean_relerr=float(np.linalg.norm(pred_mean - mc_mean) / (np.linalg.norm(mc_mean) + eps)),
+             mean_ratio=float(np.linalg.norm(pred_mean) / (np.linalg.norm(mc_mean) + eps)))
+    if pred_cov is not None:
+        off = ~np.eye(mc_cov.shape[0], dtype=bool)
+        dvp, dvm = np.diag(pred_cov), np.diag(mc_cov)
+        d.update(var_relerr=float(np.linalg.norm(dvp - dvm) / (np.linalg.norm(dvm) + eps)),
+                 off_relerr=float(np.linalg.norm((pred_cov - mc_cov)[off]) / (np.linalg.norm(mc_cov[off]) + eps)),
+                 cov_relerr=float(np.linalg.norm(pred_cov - mc_cov) / (np.linalg.norm(mc_cov) + eps)),
+                 var_ratio=float(np.linalg.norm(dvp) / (np.linalg.norm(dvm) + eps)))
+    return d
+
+def _errtable(pred, mc, keys):
+    return {kk: cumulant_errors(pred[kk][0], pred[kk][1], mc[kk][0], mc[kk][1]) for kk in keys}
+print("cumulant-fidelity knobs | depth:", CUMULANT_DEPTH, "widths:", CUMULANT_WIDTHS,
+      "MC:", f"{CUMULANT_MC:,}", "seed:", CUM_SEED)
+""")
+code(r"""
+# Propagate predicted cumulants (k=1, k=2 vanilla, k=2 exact) and compare to MC, per layer, per width.
+cum, t0 = {}, time.time()
+for w in CUMULANT_WIDTHS:
+    ckey = f"cum|d{CUMULANT_DEPTH}|w{w}|s{CUM_SEED}|mc{CUMULANT_MC}"
+    rec = cache_get(ckey); src = "recycled"
+    if rec is None:
+        src = "computed"
+        m = get_model(w, CUM_SEED, CUMULANT_DEPTH)
+        mc  = mc_layer_cumulants(m, w, CUMULANT_MC, CUM_BATCH, MC_DEVICE, MC_DTYPE)
+        k1  = kprop_layer_cumulants(m, k_max=1, exact=False)
+        k2v = kprop_layer_cumulants(m, k_max=2, exact=False)
+        k2e = kprop_layer_cumulants(m, k_max=2, exact=True)
+        keys = list(k2v.keys())
+        rec = dict(keys=keys, e_k1=_errtable(k1, mc, keys),
+                   e_k2v=_errtable(k2v, mc, keys), e_k2e=_errtable(k2e, mc, keys))
+        cache_put(ckey, rec)
+    cum[w] = rec
+    out_k = rec["keys"][-1]
+    print(f"w={w:>4} [{src:>8}] output mean rel-err: k1 {rec['e_k1'][out_k]['mean_relerr']:.3e}  "
+          f"k2 {rec['e_k2v'][out_k]['mean_relerr']:.3e}  k2-exact {rec['e_k2e'][out_k]['mean_relerr']:.3e}",
+          flush=True)
+print(f"\ncumulant fidelity done in {time.time() - t0:.1f}s")
+
+# ---- per-layer table at the largest width ----
+wbig = CUMULANT_WIDTHS[-1]; rec = cum[wbig]; keys = rec["keys"]
+print(f"\nper-layer rel-errors (depth {CUMULANT_DEPTH}, width {wbig}, seed {CUM_SEED}, MC {CUMULANT_MC:,}):")
+print("MEAN cols = rel-err of kappa_1; 'k2ex rat' = ||mu_pred||/||mu_MC||; COV split into off-diagonal & diag(var)\n")
+print(f"{'layer':>7} | {'mean k1':>8} {'mean k2':>8} {'mean k2ex':>9} {'k2ex rat':>8} "
+      f"| {'covOFF k2':>9} {'covOFF k2ex':>11} | {'covDIAG k2':>10} {'covDIAG k2ex':>12}")
+print("-" * 96)
+for k in keys:
+    e1, ev, ee = rec['e_k1'][k], rec['e_k2v'][k], rec['e_k2e'][k]
+    print(f"{k:>7} | {e1['mean_relerr']:>8.2e} {ev['mean_relerr']:>8.2e} {ee['mean_relerr']:>9.2e} "
+          f"{ee['mean_ratio']:>8.2f} | {ev.get('off_relerr', float('nan')):>9.2e} "
+          f"{ee.get('off_relerr', float('nan')):>11.2e} | {ev.get('var_relerr', float('nan')):>10.2e} "
+          f"{ee.get('var_relerr', float('nan')):>12.2e}")
+
+off_ratios = [rec['e_k2v'][k]['off_relerr'] / max(rec['e_k2e'][k]['off_relerr'], 1e-30)
+              for k in keys if 'off_relerr' in rec['e_k2v'][k]]
+print(f"\nmedian (vanilla off-diag err / exact off-diag err) over layers = {np.median(off_ratios):.2f}x"
+      "   (>1 => exact-cov tracks the off-diagonal covariance better; ~1 => no better)")
+""")
+code(r"""
+# ---- plots: (left) per-layer mean & cov fidelity at the largest width; (right) cumulant error vs width ----
+wbig = CUMULANT_WIDTHS[-1]; rec = cum[wbig]; keys = rec["keys"]; xi = np.arange(len(keys))
+fig, (a1, a2) = plt.subplots(1, 2, figsize=(13.8, 5.2))
+
+a1.semilogy(xi, [rec['e_k1'][k]['mean_relerr']  for k in keys], "o-",  label=r"mean ($\kappa_1$) k=1")
+a1.semilogy(xi, [rec['e_k2v'][k]['mean_relerr'] for k in keys], "x--", label=r"mean ($\kappa_1$) k=2")
+a1.semilogy(xi, [rec['e_k2e'][k]['mean_relerr'] for k in keys], "^:",  label=r"mean ($\kappa_1$) k=2 exact")
+a1.semilogy(xi, [rec['e_k2v'][k]['off_relerr']  for k in keys], "x--", color="0.5", label=r"cov off-diag ($\kappa_2$) k=2")
+a1.semilogy(xi, [rec['e_k2e'][k]['off_relerr']  for k in keys], "^:",  color="tab:red", label=r"cov off-diag ($\kappa_2$) k=2 exact")
+a1.set_xticks(xi); a1.set_xticklabels(keys, rotation=45, fontsize=7)
+a1.set_ylabel("relative error vs MC"); a1.set_title(f"per-layer cumulant fidelity (d{CUMULANT_DEPTH}, w{wbig})")
+a1.legend(fontsize=7); a1.grid(alpha=0.3, which="both")
+
+outk = f"pre{CUMULANT_DEPTH}"; lasthid = f"act{CUMULANT_DEPTH - 1}"
+a2.loglog(CUMULANT_WIDTHS, [cum[w]['e_k2v'][outk]['mean_relerr'] for w in CUMULANT_WIDTHS], "x--", label="output mean: k=2")
+a2.loglog(CUMULANT_WIDTHS, [cum[w]['e_k2e'][outk]['mean_relerr'] for w in CUMULANT_WIDTHS], "^:",  label="output mean: k=2 exact")
+a2.loglog(CUMULANT_WIDTHS, [cum[w]['e_k2v'][lasthid]['cov_relerr'] for w in CUMULANT_WIDTHS], "x-", color="0.5", label="last-hidden cov: k=2")
+a2.loglog(CUMULANT_WIDTHS, [cum[w]['e_k2e'][lasthid]['cov_relerr'] for w in CUMULANT_WIDTHS], "^-", color="tab:red", label="last-hidden cov: k=2 exact")
+a2.set_xlabel("width  n"); a2.set_ylabel("relative error vs MC")
+a2.set_title(f"cumulant error vs width (depth {CUMULANT_DEPTH})"); a2.legend(fontsize=8); a2.grid(alpha=0.3, which="both")
+plt.tight_layout(); plt.show()
+""")
+
+# =============================================================================
+md(r"""## §5 — How does the (final-mean) error scale? Fit $\text{error}\propto n^{\,p}$, per predictor
 
 A *working* predictor has $p<0$ (error shrinking with width) or already rides the MC floor; a *broken*
 one stays flat at $p\approx0$. We fit the slope per depth for **both** mean-prop ($k{=}1$) and kprop
@@ -394,7 +554,7 @@ else:
 """)
 
 # =============================================================================
-md(r"""## §5 — Checkpoints: save / load / **download** (recycle across sessions)
+md(r"""## §6 — Checkpoints: save / load / **download** (recycle across sessions)
 
 The sweep wrote the random models + a results cache to `checkpoints/shifted_mean_vanilla_kprop`.
 If the repo lives on Google Drive (set `LOCAL_REPO_DIR` in the bootstrap) it already persists —
@@ -419,7 +579,7 @@ if IN_COLAB:
 """)
 
 # =============================================================================
-md(r"""## §6 — Summary
+md(r"""## §7 — Summary
 
 - **What ran:** random depth-{3,4,5} ReLU MLPs (square, no bias), every hidden weight matrix
   mean-shifted by $-1/\sqrt n$ — `SHIFT="sub"`, $W=W'-\tfrac1{\sqrt n}\mathbf 1\mathbf 1^\top$ (flip to
@@ -428,16 +588,20 @@ md(r"""## §6 — Summary
 - **What $k{=}1$ is:** it propagates **only the mean** (degree-1 cumulant), with the degree-2 piece kept
   as a diagonal metric $\mathrm{diag}(WW^\top)$ — so each ReLU uses an exact *marginal* mean+variance but
   **no cross-neuron covariance**. $k{=}2$ adds that covariance.
-- **Read off §2–§4:** (i) the **unscaled magnitudes** — does $\lVert\mu_{k1}\rVert$ track
-  $\lVert\mu_{\text{MC}}\rVert$, or over/under-shoot the collapse? (ii) the **parity** — are the
-  per-coordinate means on $y=x$? (iii) the **scaling** — does either error shrink with width, and the
-  printed `median (k1 err / k2 err)` says how much the covariance buys.
+- **Final-mean error (§2–§3, §5):** the **unscaled magnitudes** (does $\lVert\mu_{k1}\rVert$ track
+  $\lVert\mu_{\text{MC}}\rVert$ or over/under-shoot the collapse), the **parity** (on $y=x$?), and the
+  width **scaling** — with the printed `median (k1 err / k2 err)` saying how much the covariance buys.
+- **Cumulant fidelity (§4):** kprop's `output_all=True` exposes every layer's tower, so we score the
+  predicted $\kappa_1$ (mean) and $\kappa_2$ (covariance) against MC **layer by layer** — splitting $\kappa_2$
+  into diagonal (variance) and off-diagonal, the latter being exactly what `exact_relu_cov` computes. The
+  printed `median (vanilla off-diag err / exact off-diag err)` says whether exact $k{=}2$ tracks the
+  covariance better; the magnitude *ratios* say whether each cumulant is kept at the right scale through depth.
 - **Why `sub` is hard:** the $-\sqrt n\,\mu$ shift at depth kills the ReLUs → the output collapses to a
   point-mass-at-0 mixture whose residual mean is a fluctuation effect a single-Gaussian (let alone
   mean-only) state may not capture. The `add` control is the easy linear-regime opposite.
 
 **Recycling:** models + MC/kprop results live in `checkpoints/shifted_mean_vanilla_kprop` (keyed by config,
-so `sub`/`add` and different $k$ never mix); re-runs load instead of recomputing, and §5 downloads the dir.
+so `sub`/`add` and different $k$ never mix); re-runs load instead of recomputing, and §6 downloads the dir.
 **GPU:** MC + kprop run on `E.DEVICE` (CUDA), float64-on-CPU fallback on MPS.""")
 
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shifted_mean_vanilla_kprop_colab.ipynb")

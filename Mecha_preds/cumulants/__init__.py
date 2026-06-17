@@ -32,10 +32,12 @@ from .adapter import (
     extract_mean,
 )
 from .metrics import estimate_empirical_mean, compare_means
+from .exact_meanprop import run_exact_meanprop, relu_gaussian_moments
 
 __all__ = [
     "run_cumulants", "model_to_kprop", "default_cumulant_config", "config_summary",
     "extract_mean", "estimate_empirical_mean", "compare_means",
+    "run_exact_meanprop", "relu_gaussian_moments",
 ]
 
 # Structured power KPROP (spike-aware: latent conditioning + power-cumulant

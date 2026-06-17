@@ -16,7 +16,7 @@ from .Tools import (
     activation_pca, weight_spectrum,
     ablate, neuron_importance,
     activation_patch,
-    direct_contributions, output_lens,
+    direct_contributions, output_lens, cumulants_sv,
 )
 from .Tools.weight_structure import (
     mean_prev_post, weight_structure_metrics, W_last, W_first,
@@ -30,5 +30,5 @@ __all__ = [
     "activation_patch",
     "direct_contributions", "output_lens",
     "mean_prev_post", "weight_structure_metrics", "W_last", "W_first",
-    "layer_stats", "grad_flow",
+    "layer_stats", "grad_flow", "cumulants_sv"
 ]

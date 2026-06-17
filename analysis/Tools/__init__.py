@@ -24,7 +24,7 @@ from .pca import activation_pca, weight_spectrum
 from .ablation import ablate, neuron_importance
 from .patching import activation_patch
 from .attribution import direct_contributions, output_lens
-import cumulants_sv
+from . import cumulants_sv
 
 __all__ = [
     "collect_activations", "run_with_intervention",

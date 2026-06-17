@@ -1,50 +1,40 @@
 """Generates shifted_mean_vanilla_kprop_colab.ipynb (valid nbformat-4 JSON).
 
-The SIMPLE companion of the structured-kprop study. Two opposite mean-shift regimes,
-selected by SHIFT, with the SAME |spike| = sqrt(n) but opposite SIGN:
+The SIMPLE companion of the structured-kprop study. Random mean-shifted MLPs, NO
+TRAINING, and the question: how well does PURE MEAN PROPAGATION (k_max=1) estimate the
+output mean -- and how much does adding the covariance (k_max=2) buy?
 
-    NO TRAINING.  Each model is just a random Gaussian MLP whose HIDDEN weight
-    matrices are mean-shifted by +/- 1/sqrt(n):
+    W = W' + B,   W'_{ij} ~ N(0, 1/fan_in)  (i.i.d. Gaussian)
+                  B = s * (1/sqrt(n)) 11^T,   s = -1 ("sub", DEFAULT) or +1 ("add")
 
-        W = W' + B,   W'_{ij} ~ N(0, 1/fan_in)  (i.i.d. Gaussian)
-                      B = s * (1/sqrt(n)) 11^T,   s = +1 ("add") or -1 ("sub")
+The shift is on the HIDDEN matrices only. Same |spike| = sqrt(n); the SIGN sets the regime
+(see below). Default here is SUB (s=-1): the regime where the output collapses and a Gaussian
+closure struggles -- the interesting stress test for a mean-only predictor.
 
-Why the SIGN flips the story (the point of this notebook). The shift hits every hidden
-layer. Layer 1 sees x ~ N(0,I) (mean zero), so z^1 = W^1 x is mean-zero regardless of s
--- one genuinely rectified layer. But for layers ell >= 2 the input a^{ell-1} is a
-POST-ReLU activation with a POSITIVE mean mu>0, so 1^T a ~ n*mu and the shared shift is
+Two predictors, both "traditional" cumulant propagation, differing only in budget k_max:
+  * MEAN-PROP  (k_max=1): tracks ONLY the degree-1 cumulant (the mean). The degree-2 piece
+    is kept as a DIAGONAL metric (get_r_x(2,1)=1; linear_kprop sets metric = diag(W W^T)),
+    so each ReLU uses an exact per-neuron marginal Gaussian moment (mean + marginal variance)
+    but NO cross-neuron covariance. The cheapest "mean-field" kprop.
+  * KPROP k=2  (k_max=2): adds the full off-diagonal covariance as a tracked cumulant.
+Both vs a Monte-Carlo reference. (k_max=1 is explicitly supported in kprop_harmonic.py.)
 
-        s * (1/sqrt n) * (1^T a) ~ s * sqrt(n) * mu      (an O(sqrt n) mean shift per neuron!)
+Why the SIGN sets the regime. Layer 1 sees x ~ N(0,I) (mean 0), so z^1 = W^1 x is mean-zero
+either way. But for layers ell >= 2 the input a^{ell-1} is POST-ReLU with mean mu > 0, so
+1^T a ~ n*mu and the shared shift is s*(1/sqrt n)*(1^T a) ~ s*sqrt(n)*mu (an O(sqrt n) mean shift):
+  * s=-1 ("sub"): pre-acts strongly NEGATIVE -> ReLUs DIE -> output collapses to ~0 (a
+    point-mass-at-0 mixture). The TRUE mean is a small fluctuation effect; whether a mean-only
+    (k=1) state can estimate it at all -- vs k=2 -- is exactly what this notebook measures.
+  * s=+1 ("add"): pre-acts strongly POSITIVE -> ReLUs LINEAR -> activations ~Gaussian -> both
+    closures should be accurate (a useful sanity control; flip SHIFT="add").
 
-  * s = -1 ("sub"): pre-activations driven strongly NEGATIVE -> ReLUs DIE -> a^ell -> 0,
-    the output collapses to ~0, and the activation law becomes a point-mass-at-0 mixture
-    a single-Gaussian k=2 state cannot represent -> kprop is very inaccurate (the regime
-    we saw fail; cumulants don't capture the dead-ReLU collapse).
-  * s = +1 ("add"): pre-activations driven strongly POSITIVE -> ReLUs sit in their LINEAR
-    branch (ReLU(z)=z for ~all neurons) -> the layer is effectively LINEAR -> a stays
-    ~GAUSSIAN -> and cumulant propagation is EXACT on linear maps. So we EXPECT kprop to
-    WORK here, with an error that is small and ideally SHRINKS with width (the dead
-    fraction ~ Phi(-sqrt(n) mu/sigma) -> 0). This notebook tests that prediction.
+Why hidden layers only / why these k. kprop is EXACT on the final linear readout, so shifting
+it adds no prediction error (it only rescales ||E[out]||). Both k=1 and k=2 are feasible at every
+width up to 3072 (k=2 is the n x n covariance; k>=3 would be an n^3 tensor, infeasible).
 
-So the spectral spike B = s*sqrt(n)*v v^T (v = 1/sqrt n) is identical in size; the SIGN,
-interacting with the positive post-ReLU mean at depth, decides "dead vs linear".
-
-Why hidden layers only (not the readout). kprop is EXACT on the final linear map:
-E[out] = W_readout * E[a], and MC computes the same thing, so shifting the readout adds
-zero prediction error -- it only changes the output scale ||E[out]||. The ReLU layers are
-where the sign actually matters. (Matches the validated structured_kprop/shifted_mean setup.)
-
-Why k=2 (and not the default k=3). The degree-3 cumulant is an n^3 tensor -- at n=3072
-that is ~2.9e10 entries (infeasible). Both regimes are a k=2 story (dead-mixture vs linear),
-so the whole sweep runs harmonic kprop at k_max=2 (plus the exact-ReLU-cov k=2 variant).
-
-REPO POLICIES THIS NOTEBOOK HONORS
-  * Recycling: there is no training to recycle, but the FLOP-heavy Monte-Carlo
-    references + kprop predictions are cached by config in
-    checkpoints/shifted_mean_vanilla_kprop so a re-run recomputes nothing; the random
-    models are saved there too (reproducible). A Colab cell zips/downloads the dir.
-  * GPU: MC + kprop run on E.DEVICE (CUDA float32 compute, float64 accumulators;
-    float64 falls back to CPU on Apple MPS, which has no float64).
+REPO POLICIES: recycling (MC + kprop cached by config under checkpoints/shifted_mean_vanilla_kprop;
+models saved too; nothing recomputed on a re-run); GPU (MC + kprop on E.DEVICE; float64 falls back
+to CPU on Apple MPS).
 
 Needs Python >= 3.12 OR the skprop kprop-compat shim (auto-active on import); + torch.
 Run:  python "colab_notebooks/shifted_mean_vanilla_kprop/build_shifted_mean_vanilla_kprop_notebook.py"
@@ -59,57 +49,47 @@ nb = NotebookBuilder()
 md, code = nb.md, nb.code
 
 # =============================================================================
-md(r"""# Does kprop work when the shift pushes ReLUs into their **linear** regime? ($+1/\sqrt n$, **no training**)
+md(r"""# How good is **pure mean propagation** ($k{=}1$) at estimating the output mean? (negative shift, **no training**)
 
-**Setup — random models, then shift the weights.** Depth $d\in\{3,4,5\}$ ReLU MLPs,
-square layers, no bias, `input_dim = output_dim = width` (all widths equal). Every weight
-matrix is drawn $W'_{ij}\sim\mathcal N(0,1/\text{fan\_in})$ and then the **hidden** matrices are
-mean-shifted by $\pm 1/\sqrt n$ (`SHIFT="add"` $\Rightarrow s=+1$, the default; `"sub"` $\Rightarrow s=-1$):
+**Setup — random models, then shift the weights.** Depth $d\in\{3,4,5\}$ ReLU MLPs, square layers,
+no bias, `input_dim = output_dim = width` (all widths equal). Each weight is drawn
+$W'_{ij}\sim\mathcal N(0,1/\text{fan\_in})$ and the **hidden** matrices are mean-shifted by $s/\sqrt n$
+(`SHIFT="sub"` $\Rightarrow s=-1$, the default; `"add"` $\Rightarrow s=+1$):
 
-$$W = W' + B,\qquad B = s\,\tfrac{1}{\sqrt n}\,\mathbf 1\mathbf 1^\top = s\,\sqrt n\,\hat v\hat v^\top\ \ (\hat v=\mathbf 1/\sqrt n).$$
+$$W = W' + B,\qquad B = s\,\tfrac{1}{\sqrt n}\,\mathbf 1\mathbf 1^\top .$$
 
-The spike size is $\sqrt n$ in **both** cases; only the **sign** changes. **No training** — we
-generate the model, shift it, and immediately run kprop.
+**No training** — generate, shift, run kprop.
 
-**Why the sign flips the outcome.** Layer 1 sees $x\sim\mathcal N(0,I)$, so $z^1=W^1x$ is
-mean-zero either way (one genuinely rectified layer). But for layers $\ell\ge 2$ the input
-$a^{\ell-1}$ is a **post-ReLU** activation with a **positive** mean $\mu>0$, so
-$\mathbf 1^\top a\approx n\mu$ and the shared shift becomes
+**The predictors — both cumulant propagation, differing only in the budget $k_{\max}$:**
 
-$$s\,\tfrac1{\sqrt n}\,(\mathbf 1^\top a)\ \approx\ s\,\sqrt n\,\mu\qquad(\text{an }O(\sqrt n)\text{ mean shift on every neuron}).$$
+1. **mean-prop ($k{=}1$)** — tracks **only the mean** (degree-1 cumulant). The degree-2 piece is
+   collapsed to a **diagonal** metric ($\mathrm{diag}(WW^\top)$), so each ReLU uses an exact *per-neuron
+   marginal* Gaussian moment (mean + marginal variance) but **no cross-neuron covariance**. The cheapest
+   "mean-field" kprop — *the predictor under test.*
+2. **kprop ($k{=}2$)** — adds the full off-diagonal **covariance** as a tracked cumulant (the reference).
 
-- **`sub` ($s=-1$):** pre-activations driven strongly **negative** → ReLUs **die** → $a\to0$, the
-  output collapses, the law is a point-mass-at-0 mixture → a single-Gaussian $k{=}2$ state can't
-  represent it → kprop is very inaccurate. *(The regime we already saw fail — cumulants miss the collapse.)*
-- **`add` ($s=+1$, default):** pre-activations driven strongly **positive** → ReLUs sit in their
-  **linear** branch, $\mathrm{ReLU}(z)=z$ for ~all neurons → the layer is effectively **linear** → the
-  activations stay **~Gaussian**, and cumulant propagation is **exact on linear maps**. So the
-  **expectation is that kprop WORKS here** — small relative error that ideally **shrinks** with width
-  (the dead fraction $\sim\Phi(-\sqrt n\,\mu/\sigma)\to0$). **This notebook tests that.**
+Both compared against a Monte-Carlo mean. *Question:* in the collapse regime, can a mean-only state
+estimate the (small, fluctuation-driven) output mean at all — and how much does the $k{=}2$ covariance help?
 
-**Two $k{=}2$ predictors (both traditional kprop):** *vanilla* harmonic (ReLU off-diagonal via the
-leading-order gain approx) and *exact-ReLU-cov* (`exact_relu_cov=True`, the exact bivariate-Gaussian
-ReLU covariance via Owen's T). In the linear `add` regime both should agree with MC; the comparison
-just confirms the covariance approximation isn't the bottleneck.
+**Why `sub` is the stress test.** Layer 1 sees $x\sim\mathcal N(0,I)$, so $z^1=W^1x$ is mean-zero. But
+for layers $\ell\ge2$ the input is post-ReLU with mean $\mu>0$, so the shared shift is
+$s\sqrt n\,\mu$. With $s=-1$ this is a large **negative** push → ReLUs **die** → the output collapses to
+$\approx0$ (a point-mass-at-0 mixture). The true mean is then a delicate fluctuation effect; a single
+Gaussian (let alone a mean-only) state may miss it. *(`add` is the easy linear-regime control.)*
 
-**Design choices.**
+**Design notes.** *Hidden layers only* — kprop is exact on the linear readout, so shifting it adds zero
+prediction error (only rescales $\lVert E[\text{out}]\rVert$). *$k\in\{1,2\}$* — both feasible at every
+width to 3072 ($k{=}2$ is the $n\times n$ covariance; $k{\ge}3$ is an $n^3$ tensor, infeasible).
 
-- **Hidden layers only.** kprop is *exact* on the final linear readout ($E[\text{out}]=W_{\text{ro}}E[a]$,
-  same as MC), so shifting the readout adds **zero** prediction error — it only changes the output scale.
-  The ReLUs are where the sign matters.
-- **$k_{\max}=2$.** The degree-3 cumulant is an $n^3$ tensor ($\sim\!2.9\times10^{10}$ at $n{=}3072$,
-  infeasible); both regimes are a $k{=}2$ story. Exact-cov is **scipy/CPU, $O(n^2)$ memory**, so it
-  runs only up to `EXACT_COV_MAX_WIDTH` (vanilla + MC run all widths).
+> **Recycling + GPU (repo policy).** MC references + kprop predictions are **cached by config** in
+> `checkpoints/shifted_mean_vanilla_kprop` (models saved too); a re-run recomputes nothing. MC + kprop
+> run on **`E.DEVICE`** (CUDA; float64 falls back to CPU on Apple MPS).
 
-> **Recycling + GPU (repo policy).** No training to recycle, but the expensive MC references and kprop
-> predictions are **cached by config** in `checkpoints/shifted_mean_vanilla_kprop` (models saved there
-> too); a re-run recomputes nothing. MC + vanilla kprop run on **`E.DEVICE`** (CUDA; exact-cov is scipy/CPU).
-
-| | view | expectation (`add`, $s=+1$) |
+| | view | what to look for (`sub`, $s=-1$) |
 |---|---|---|
-| **§2** | actual unscaled $\lVert E[\text{out}]\rVert$ (MC vs both kprop) **beside** the scaled rel-$L_2$ error | kprop **matches** MC's magnitude; error small, **decreasing** in $n$ toward the MC floor |
-| **§3** | per-coordinate parity (kprop vs MC) + magnitudes table | points sit **on** $y=x$ (slope$\approx$corr$\approx1$); vanilla $\approx$ exact-cov |
-| **§4** | fit $\text{error}\propto n^{\,p}$, per predictor | slope $p<0$ (or near floor) — kprop **works** here, unlike the flat $p\approx0$ of `sub` |
+| **§2** | actual unscaled $\lVert E[\text{out}]\rVert$ (MC vs $k{=}1$ vs $k{=}2$) **beside** the scaled rel-$L_2$ error | does $k{=}1$ even track the collapsed magnitude? how far is each from MC? |
+| **§3** | per-coordinate parity ($k{=}1$ & $k{=}2$ vs MC) + magnitudes table | are the points on $y=x$, or does mean-prop sit off-axis? $k{=}2$ vs $k{=}1$ gap |
+| **§4** | fit $\text{error}\propto n^{\,p}$, per predictor | does either error shrink with width, or stay $O(1)$? how much does covariance buy? |
 
 Needs Python ≥ 3.12 *or* the skprop kprop-compat shim (auto-active on import), plus torch.""")
 
@@ -118,8 +98,8 @@ code(BOOTSTRAP_CELL)
 # =============================================================================
 md(r"""## 1. Config — knobs, device & recycling (probe here, not in `experiments.py`)
 
-`WIDTHS` runs up to **3072**; `DEPTHS = [3,4,5]`; `SEEDS = [1,2]`. On a CPU-only machine
-`QUICK` trims to a tiny smoke sweep. Everything is cached by config under `CKPT_DIR`.""")
+`WIDTHS` runs up to **3072**; `DEPTHS = [3,4,5]`; `SEEDS = [1,2]`. The predictor under test is
+`KMAX_MEANPROP = 1` (pure mean propagation); `KMAX_REF = 2` is the covariance-aware reference.""")
 code(r"""
 import math, time, os, copy
 import numpy as np
@@ -139,18 +119,14 @@ DEPTHS      = [3] if QUICK else [3, 4, 5]
 WIDTHS      = [32, 64, 128] if QUICK else [64, 128, 256, 512, 1024, 2048, 3072]
 SEEDS       = [1, 2]
 ACTIVATION  = "relu"
-SHIFT       = "add"                    # "add": W = W' + (1/sqrt n)11^T  -> pre-acts POSITIVE -> ReLU ~LINEAR -> kprop should WORK
-                                       # "sub": W = W' - (1/sqrt n)11^T  -> pre-acts to 0 -> DEAD ReLUs -> kprop fails
-SIGN        = +1.0 if SHIFT == "add" else -1.0
-K_MAX       = 2                        # traditional harmonic kprop; k>=3 is an n^3 tensor (infeasible at 3072)
+SHIFT       = "sub"                    # "sub": W = W' - (1/sqrt n)11^T  -> pre-acts NEGATIVE -> DEAD ReLUs (the stress test)
+                                       # "add": W = W' + (1/sqrt n)11^T  -> pre-acts POSITIVE -> ReLU ~linear (easy control)
+SIGN        = -1.0 if SHIFT == "sub" else +1.0
 MC_SAMPLES  = 100_000 if QUICK else 1_000_000
 
-# ---- second predictor: EXACT bivariate-Gaussian ReLU covariance (k=2, ReLU only) ----
-# Same k=2 closure but the exact off-diagonal ReLU covariance instead of the gain approx.
-# It is scipy/CPU and materializes several n x n matrices per ReLU layer -> O(n^2) memory and
-# tens of seconds at large n, so cap its width (vanilla + MC still run every width).
-EXACT_COV           = True
-EXACT_COV_MAX_WIDTH = 128 if QUICK else 2048
+# ---- the two predictors: budget k_max only ----
+KMAX_MEANPROP = 1                      # PREDICTOR UNDER TEST: pure mean propagation (degree-1 cumulant only)
+KMAX_REF      = 2                      # reference: covariance-aware kprop (full k=2 off-diagonal)
 
 # ---- GPU policy: float32 compute on GPU, float64 for measurement (repo policy) ----
 # MC accumulators + kprop need float64. CUDA has float64 -> run on GPU. Apple MPS has
@@ -169,8 +145,8 @@ os.makedirs(CKPT_DIR, exist_ok=True)
 
 print("DEVICE:", DEVICE, "| MC:", MC_DEVICE.type, MC_DTYPE, "batch", MC_BATCH, "| kprop dev:", KPROP_DEVICE)
 print("QUICK:", QUICK, "| depths:", DEPTHS, "| widths:", WIDTHS, "| seeds:", SEEDS)
-print(f"shift: {SHIFT} (s={int(SIGN):+d}) | k_max:", K_MAX, "| MC_SAMPLES:", f"{MC_SAMPLES:,}", "| CKPT_DIR:", CKPT_DIR)
-print("exact-ReLU-cov:", EXACT_COV, "(scipy/CPU) up to width", EXACT_COV_MAX_WIDTH)
+print(f"shift: {SHIFT} (s={int(SIGN):+d}) | predictors: mean-prop k={KMAX_MEANPROP} vs kprop k={KMAX_REF}"
+      f" | MC_SAMPLES: {MC_SAMPLES:,} | CKPT_DIR: {CKPT_DIR}")
 """)
 
 code(r"""
@@ -216,8 +192,8 @@ def get_model(w, seed, depth):
                         "depth": depth, "width": w, "seed": seed})
     return m
 
-# results cache: one .pt per CONFIG signature (changing k_max / MC_SAMPLES / shift / exact-cov -> fresh file)
-CFG_SIG = f"kmax{K_MAX}_mc{MC_SAMPLES}_{SHIFT}_{ACTIVATION}_exact{int(EXACT_COV)}w{EXACT_COV_MAX_WIDTH}"
+# results cache: one .pt per CONFIG signature (changing k_max's / MC_SAMPLES / shift -> fresh file)
+CFG_SIG = f"mp{KMAX_MEANPROP}_ref{KMAX_REF}_mc{MC_SAMPLES}_{SHIFT}_{ACTIVATION}"
 RESULTS_PATH = os.path.join(CKPT_DIR, f"results_{CFG_SIG}.pt")
 _results = torch.load(RESULTS_PATH) if (RECYCLE and os.path.exists(RESULTS_PATH)) else {}
 def cache_get(key):       return _results.get(key) if RECYCLE else None
@@ -241,17 +217,15 @@ print(f"results cache {os.path.basename(RESULTS_PATH)}: {len(_results)} runs "
 """)
 
 # =============================================================================
-md(r"""## §2 — Width sweep: actual means **and** scaled error (depths 3–5, seeds 1–2)
+md(r"""## §2 — Width sweep: actual means **and** scaled error (mean-prop $k{=}1$ vs kprop $k{=}2$)
 
 For each `(depth, width, seed)` we keep both the **actual unscaled** output means
-$\mu_{\text{MC}}=E_{\text{MC}}[\text{out}]$ and $\mu_{\text{kprop}}$ (full vectors), and the scaled
-metric, the relative $L_2$ error $\lVert\mu_{\text{kprop}}-\mu_{\text{MC}}\rVert/\lVert\mu_{\text{MC}}\rVert$.
-Each run is recycled from the cache when present; otherwise the model is built/loaded, MC runs on the
-GPU, vanilla kprop runs, and the result is saved. `floor` is the MC sampling noise
-(`||stderr|| / ||mc||`) — the error below which we cannot resolve kprop.
+$\mu_{\text{MC}}$, $\mu_{k1}$, $\mu_{k2}$ (full vectors) and the scaled relative $L_2$ errors. Each run
+is recycled from the cache when present; otherwise the model is built/loaded, MC runs on the GPU, both
+kprop budgets run, and the result is saved. `floor` is the MC sampling noise (`||stderr|| / ||mc||`).
 
-The plot puts them **side by side**: left = the actual mean *magnitudes* $\lVert\mu\rVert$ (MC vs kprop,
-unscaled), right = the scaled relative error + MC floor.""")
+The plot puts them **side by side**: left = the actual mean *magnitudes* $\lVert\mu\rVert$ (MC vs both
+predictors, unscaled), right = the scaled relative error + MC floor.""")
 code(r"""
 rows, t0 = [], time.time()
 for depth in DEPTHS:
@@ -263,36 +237,31 @@ for depth in DEPTHS:
                 src = "computed"
                 m = get_model(w, seed, depth)
                 mc, stats = mc_reference(m, w)
-                van = run_cumulants(m, config={"k_max": K_MAX, "factor": False},
-                                    device=KPROP_DEVICE)["mean"]
-                mc = np.asarray(mc, float); van = np.asarray(van, float)   # actual UNSCALED mean vectors
+                mp = run_cumulants(m, config={"k_max": KMAX_MEANPROP, "factor": False},
+                                   device=KPROP_DEVICE)["mean"]      # MEAN PROPAGATION (k=1)
+                k2 = run_cumulants(m, config={"k_max": KMAX_REF, "factor": False},
+                                   device=KPROP_DEVICE)["mean"]      # covariance kprop (k=2)
+                mc = np.asarray(mc, float); mp = np.asarray(mp, float); k2 = np.asarray(k2, float)
                 nm = float(np.linalg.norm(mc)) + 1e-30
-                r = dict(depth=depth, w=w, seed=seed, van=rel(van, mc, stats),
+                r = dict(depth=depth, w=w, seed=seed,
+                         mp=rel(mp, mc, stats), k2=rel(k2, mc, stats),
                          floor=float(np.linalg.norm(stats["mc_stderr"])) / nm,
-                         mc_norm=float(np.linalg.norm(mc)), kp_norm=float(np.linalg.norm(van)),
-                         mc_mean=torch.tensor(mc, dtype=torch.float32),    # kept (as tensors, ~12 KB each)
-                         kp_mean=torch.tensor(van, dtype=torch.float32))   # for the per-coordinate parity view
-                # 2nd predictor: EXACT bivariate-Gaussian ReLU covariance (k=2). scipy/CPU, O(n^2)
-                # memory -> only up to EXACT_COV_MAX_WIDTH. Reuses the SAME MC reference (no rerun).
-                if EXACT_COV and w <= EXACT_COV_MAX_WIDTH:
-                    exa = np.asarray(run_cumulants(m, config={"k_max": 2, "exact_relu_cov": True},
-                                                   device="cpu")["mean"], float)
-                    r.update(exa=rel(exa, mc, stats), exa_norm=float(np.linalg.norm(exa)),
-                             exa_mean=torch.tensor(exa, dtype=torch.float32))
-                else:
-                    r.update(exa=float("nan"), exa_norm=float("nan"), exa_mean=None)
+                         mc_norm=float(np.linalg.norm(mc)), mp_norm=float(np.linalg.norm(mp)),
+                         k2_norm=float(np.linalg.norm(k2)),
+                         mc_mean=torch.tensor(mc, dtype=torch.float32),   # actual UNSCALED mean vectors,
+                         mp_mean=torch.tensor(mp, dtype=torch.float32),   # kept (~12 KB each) for the
+                         k2_mean=torch.tensor(k2, dtype=torch.float32))   # per-coordinate parity view
                 cache_put(key, r)
             rows.append(r)
-            exa_s = f"{r['exa']:.3e}" if np.isfinite(r['exa']) else "  (skip) "
-            print(f"d{depth} w={w:>4} s{seed} [{src:>8}] | rel-err: vanilla {r['van']:.3e}  "
-                  f"exact-cov {exa_s} (floor {r['floor']:.1e}) | ||mu||: MC {r['mc_norm']:.3e}  "
-                  f"van {r['kp_norm']:.3e}  exa {r['exa_norm']:.3e}", flush=True)
+            print(f"d{depth} w={w:>4} s{seed} [{src:>8}] | rel-err: mean-prop(k1) {r['mp']:.3e}  "
+                  f"kprop(k2) {r['k2']:.3e} (floor {r['floor']:.1e}) | ||mu||: MC {r['mc_norm']:.3e}  "
+                  f"k1 {r['mp_norm']:.3e}  k2 {r['k2_norm']:.3e}", flush=True)
 print(f"\nsweep done in {time.time() - t0:.1f}s ({len(rows)} runs; recycled ones are instant)")
 """)
 code(r"""
 from matplotlib.lines import Line2D
 def series(depth, key):
-    "mean over seeds of `key` at each width, for one depth (NaN where exact-cov was skipped)"
+    "mean over seeds of `key` at each width, for one depth"
     return [float(np.mean([r[key] for r in rows if r["depth"] == depth and r["w"] == w]))
             for w in WIDTHS]
 
@@ -301,21 +270,21 @@ cmap = dict(zip(DEPTHS, colors))           # colour encodes DEPTH; marker/linest
 op = "+" if SIGN > 0 else "-"              # sign of the shift, for the titles
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(13.8, 5.4))
 
-# LEFT -- actual UNSCALED magnitude ||E[out]||: MC (o-) vs vanilla (x--) vs exact-cov (^:)
+# LEFT -- actual UNSCALED magnitude ||E[out]||: MC (o-) vs mean-prop k=1 (x--) vs kprop k=2 (^:)
 for d in DEPTHS:
     c = cmap[d]
-    axL.loglog(WIDTHS, series(d, "mc_norm"),  "o-",  color=c)
-    axL.loglog(WIDTHS, series(d, "kp_norm"),  "x--", color=c)
-    axL.loglog(WIDTHS, series(d, "exa_norm"), "^:",  color=c)   # NaN past the width cap -> line stops
+    axL.loglog(WIDTHS, series(d, "mc_norm"), "o-",  color=c)
+    axL.loglog(WIDTHS, series(d, "mp_norm"), "x--", color=c)
+    axL.loglog(WIDTHS, series(d, "k2_norm"), "^:",  color=c)
 axL.set_xlabel("width  n"); axL.set_ylabel(r"$\|E[\mathrm{out}]\|_2$   (unscaled)")
 axL.set_title(r"actual mean magnitude on $W=W'" + op + r"\frac{1}{\sqrt n}11^\top$ (MC vs kprop)")
 axL.grid(alpha=0.3, which="both")
 
-# RIGHT -- SCALED relative L2 error: vanilla (x--) vs exact-cov (^:), + one MC-noise-floor line
+# RIGHT -- SCALED relative L2 error: mean-prop k=1 (x--) vs kprop k=2 (^:), + one MC-noise-floor line
 for d in DEPTHS:
     c = cmap[d]
-    axR.loglog(WIDTHS, series(d, "van"), "x--", color=c)
-    axR.loglog(WIDTHS, series(d, "exa"), "^:",  color=c)
+    axR.loglog(WIDTHS, series(d, "mp"), "x--", color=c)
+    axR.loglog(WIDTHS, series(d, "k2"), "^:",  color=c)
 floor_hi = [max(series(d, "floor")[i] for d in DEPTHS) for i in range(len(WIDTHS))]
 axR.loglog(WIDTHS, floor_hi, "-", color="0.6", lw=1.1, label="MC noise floor")
 axR.set_xlabel("width  n"); axR.set_ylabel(r"$\|\mu_{\mathrm{pred}}-\mu_{\mathrm{MC}}\| / \|\mu_{\mathrm{MC}}\|$")
@@ -325,8 +294,8 @@ axR.grid(alpha=0.3, which="both")
 # dual key: colour = depth, marker/linestyle = predictor (shared across both panels)
 depth_h = [Line2D([0], [0], color=cmap[d], lw=2.4, label=f"depth {d}") for d in DEPTHS]
 pred_h  = [Line2D([0], [0], color="0.35", marker="o", ls="-",  label="MC (truth)"),
-           Line2D([0], [0], color="0.35", marker="x", ls="--", label="vanilla k=2"),
-           Line2D([0], [0], color="0.35", marker="^", ls=":",  label="exact-cov k=2")]
+           Line2D([0], [0], color="0.35", marker="x", ls="--", label="mean-prop  k=1"),
+           Line2D([0], [0], color="0.35", marker="^", ls=":",  label="kprop  k=2")]
 _l1 = axL.legend(handles=depth_h, loc="lower right", fontsize=8, title="colour = depth"); axL.add_artist(_l1)
 axL.legend(handles=pred_h, loc="upper left", fontsize=8, title="style = predictor")
 axR.legend(loc="lower left", fontsize=8)   # MC-floor line; colour/style key is the left panel
@@ -337,68 +306,58 @@ plt.tight_layout(); plt.show()
 md(r"""## §3 — The actual means, unscaled: magnitudes table + per-coordinate parity
 
 The relative error hides *what the means actually are*. Here we read them raw. The table prints the
-unscaled magnitudes $\lVert\mu_{\text{MC}}\rVert$ and the two predictors' magnitudes with their ratios
-to MC. The scatter takes one representative model (largest width where exact-cov ran) and plots **both**
-predictors' mean against MC's **per output coordinate** — a perfect predictor sits on the dashed $y=x$
-line. In the `add` regime the points should land **on** $y=x$ (slope$\approx$corr$\approx1$, ratio$\approx1$),
-confirming kprop recovers the actual mean; in `sub` they collapse toward $0$ (kprop misses it). Vanilla
-(blue) and exact-cov (red) should overlap.""")
+unscaled magnitudes $\lVert\mu_{\text{MC}}\rVert$, $\lVert\mu_{k1}\rVert$, $\lVert\mu_{k2}\rVert$ and the
+ratios to MC. The scatter takes one representative model (largest width) and plots **both** predictors'
+mean against MC's **per output coordinate** — a perfect predictor sits on the dashed $y=x$ line, so the
+spread/tilt off it is the literal bias. Watch whether mean-prop ($k{=}1$, blue) is even on the same axis
+as the covariance kprop ($k{=}2$, red), and how far either sits from $y=x$.""")
 code(r"""
-# --- numeric table: ACTUAL unscaled magnitudes, MC vs vanilla vs exact-cov (mean over seeds) ---
+# --- numeric table: ACTUAL unscaled magnitudes, MC vs mean-prop(k1) vs kprop(k2) (mean over seeds) ---
 print("actual UNSCALED output-mean magnitudes (averaged over seeds):\n")
-print(f"{'depth':>5} {'width':>6} | {'||mu_MC||':>11} | {'||mu_van||':>11} {'van/MC':>7} "
-      f"| {'||mu_exa||':>11} {'exa/MC':>7}")
+print(f"{'depth':>5} {'width':>6} | {'||mu_MC||':>11} | {'||mu_k1||':>11} {'k1/MC':>7} "
+      f"| {'||mu_k2||':>11} {'k2/MC':>7}")
 print("-" * 70)
 for depth in DEPTHS:
     for w in WIDTHS:
         rs = [r for r in rows if r["depth"] == depth and r["w"] == w]
         mcn = float(np.mean([r["mc_norm"] for r in rs]))
-        van = float(np.mean([r["kp_norm"] for r in rs]))
-        exn = float(np.mean([r["exa_norm"] for r in rs]))     # NaN if exact-cov skipped at this width
-        tail = f"| {exn:>11.4e} {exn / mcn:>7.3f}" if np.isfinite(exn) else f"| {'(skip)':>11} {'—':>7}"
-        print(f"{depth:>5} {w:>6} | {mcn:>11.4e} | {van:>11.4e} {van / mcn:>7.3f} {tail}")
+        k1n = float(np.mean([r["mp_norm"] for r in rs]))
+        k2n = float(np.mean([r["k2_norm"] for r in rs]))
+        print(f"{depth:>5} {w:>6} | {mcn:>11.4e} | {k1n:>11.4e} {k1n / mcn:>7.3f} "
+              f"| {k2n:>11.4e} {k2n / mcn:>7.3f}")
 
-# --- parity scatter at the largest width where BOTH kprop variants ran ---
-cap_widths = [w for w in WIDTHS if EXACT_COV and w <= EXACT_COV_MAX_WIDTH]
-W0 = max(cap_widths) if cap_widths else WIDTHS[-1]
-D0, S0 = DEPTHS[0], SEEDS[0]
+# --- parity scatter at the largest width (both predictors run at every width) ---
+W0, D0, S0 = WIDTHS[-1], DEPTHS[0], SEEDS[0]
 rr = next(r for r in rows if r["depth"] == D0 and r["w"] == W0 and r["seed"] == S0)
 mc_v = np.asarray(rr["mc_mean"], float)
-kp_v = np.asarray(rr["kp_mean"], float)
-ex_v = np.asarray(rr["exa_mean"], float) if rr["exa_mean"] is not None else None
+k1_v = np.asarray(rr["mp_mean"], float)
+k2_v = np.asarray(rr["k2_mean"], float)
 
 def _fit(y):
     s = float(np.polyfit(mc_v, y, 1)[0]); return s, float(np.corrcoef(mc_v, y)[0, 1])
-sv, cv = _fit(kp_v)
-arrs = [mc_v, kp_v] + ([ex_v] if ex_v is not None else [])
-lim = float(max(np.abs(a).max() for a in arrs)) * 1.1
+s1, c1 = _fit(k1_v); s2, c2 = _fit(k2_v)
+lim = float(max(np.abs(mc_v).max(), np.abs(k1_v).max(), np.abs(k2_v).max())) * 1.1
 
 fig, ax = plt.subplots(figsize=(6.4, 6.2))
 ax.axhline(0, color="0.85", lw=0.8); ax.axvline(0, color="0.85", lw=0.8)
 ax.plot([-lim, lim], [-lim, lim], "k--", lw=1, label="$y=x$ (perfect)")
-ax.scatter(mc_v, kp_v, s=9, alpha=0.35, color="tab:blue",
-           label=f"vanilla  (slope {sv:.2f}, corr {cv:.2f})")
-if ex_v is not None:
-    se, ce = _fit(ex_v)
-    ax.scatter(mc_v, ex_v, s=9, alpha=0.35, color="tab:red",
-               label=f"exact-cov  (slope {se:.2f}, corr {ce:.2f})")
+ax.scatter(mc_v, k1_v, s=9, alpha=0.35, color="tab:blue", label=f"mean-prop k=1  (slope {s1:.2f}, corr {c1:.2f})")
+ax.scatter(mc_v, k2_v, s=9, alpha=0.35, color="tab:red",  label=f"kprop k=2  (slope {s2:.2f}, corr {c2:.2f})")
 ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_aspect("equal")
 ax.set_xlabel(r"MC mean  $\mu_{\mathrm{MC}}[i]$  (unscaled)")
 ax.set_ylabel(r"kprop mean  $\mu_{\mathrm{pred}}[i]$  (unscaled)")
 ax.set_title(f"actual per-coordinate means: kprop vs MC  (depth {D0}, width {W0}, seed {S0})")
 ax.legend(fontsize=8); ax.grid(alpha=0.3); plt.tight_layout(); plt.show()
 print(f"\nrep d{D0} w{W0} s{S0}:  ||mu_MC|| = {np.linalg.norm(mc_v):.4e}   "
-      f"||mu_van|| = {np.linalg.norm(kp_v):.4e}"
-      + (f"   ||mu_exa|| = {np.linalg.norm(ex_v):.4e}" if ex_v is not None else ""))
+      f"||mu_k1|| = {np.linalg.norm(k1_v):.4e}   ||mu_k2|| = {np.linalg.norm(k2_v):.4e}")
 """)
 
 # =============================================================================
 md(r"""## §4 — How does the error scale? Fit $\text{error}\propto n^{\,p}$, per predictor
 
-A *working* predictor has $p<0$ (error shrinking with width) or already rides the MC floor. The `add`
-regime should look like that: the linearized ReLUs keep the activations Gaussian, so the $k{=}2$ closure
-is (near) exact and the residual error falls as the dead fraction $\to0$. (`sub` instead gives the flat
-$p\approx0$ of a broken predictor.) We fit the slope per depth for **both** vanilla and exact-cov.""")
+A *working* predictor has $p<0$ (error shrinking with width) or already rides the MC floor; a *broken*
+one stays flat at $p\approx0$. We fit the slope per depth for **both** mean-prop ($k{=}1$) and kprop
+($k{=}2$), and report how much (if anything) the covariance buys.""")
 code(r"""
 def fit_slope(key):
     "log-log slope of (mean rel-err vs width) per depth, over the widths where the value is finite & >0"
@@ -409,30 +368,29 @@ def fit_slope(key):
         out[depth] = float(np.polyfit(np.log(w[ok]), np.log(e[ok]), 1)[0]) if ok.sum() >= 2 else float("nan")
     return out
 
-sl_van, sl_exa = fit_slope("van"), fit_slope("exa")
-print("log-log slope p of (rel-err vs width):  p~0 => O(1) constant error (kprop fails); p<0 => shrinking\n")
-print(f"{'depth':>5} | {'vanilla p':>10} {'van err@maxN':>13} | {'exact p':>8} {'exa err@maxW':>13} | {'floor@maxN':>11}")
+sl_k1, sl_k2 = fit_slope("mp"), fit_slope("k2")
+print("log-log slope p of (rel-err vs width):  p~0 => O(1) constant error; p<0 => shrinking with width\n")
+print(f"{'depth':>5} | {'k1 slope':>9} {'k1 err@maxN':>13} | {'k2 slope':>9} {'k2 err@maxN':>13} | {'floor@maxN':>11}")
 print("-" * 74)
+ratios = []
 for depth in DEPTHS:
-    ev = np.array(series(depth, "van")); ee = np.array(series(depth, "exa")); fl = np.array(series(depth, "floor"))
-    ee_ok = ee[np.isfinite(ee)]; exa_last = ee_ok[-1] if ee_ok.size else float("nan")
-    print(f"{depth:>5} | {sl_van[depth]:>10.3f} {ev[-1]:>13.3e} | {sl_exa[depth]:>8.3f} {exa_last:>13.3e} | {fl[-1]:>11.1e}")
+    e1 = np.array(series(depth, "mp")); e2 = np.array(series(depth, "k2")); fl = np.array(series(depth, "floor"))
+    ratios.append(e1[-1] / max(e2[-1], 1e-30))
+    print(f"{depth:>5} | {sl_k1[depth]:>9.3f} {e1[-1]:>13.3e} | {sl_k2[depth]:>9.3f} {e2[-1]:>13.3e} | {fl[-1]:>11.1e}")
 
-shrinking  = all(np.isfinite(sl_van[d]) and sl_van[d] < -0.10 for d in DEPTHS)
-near_floor = all(series(d, "van")[-1] < 5 * series(d, "floor")[-1] for d in DEPTHS)
+k1_flat   = all(np.isfinite(sl_k1[d]) and abs(sl_k1[d]) < 0.15 for d in DEPTHS)
+k2_better = float(np.median(ratios))      # >1 means k=1 error is that many x worse than k=2
+near_floor_k2 = all(series(d, "k2")[-1] < 5 * series(d, "floor")[-1] for d in DEPTHS)
 print()
-print(f"=> vanilla slopes p: {{{', '.join(f'd{d}:{sl_van[d]:+.2f}' for d in DEPTHS)}}}"
-      f" | error near MC floor at max width: {near_floor}")
-if SIGN > 0:
-    print("   ADD regime: the +sqrt(n)*mu shift at depth>=2 drives pre-activations strongly POSITIVE, so the")
-    print("   ReLUs sit in their LINEAR branch -> activations stay ~Gaussian -> the k=2 closure is (near) exact.")
-    print(f"   => kprop WORKS here: error {'shrinks with width (p<0)' if shrinking else 'stays small'}"
-          f"{', riding the MC floor' if near_floor else ''}; vanilla and exact-cov agree (the covariance")
-    print("   approximation was never the bottleneck once the layer is linear).")
+print(f"=> mean-prop(k1) slopes ~flat: {k1_flat} | median (k1 err / k2 err) = {k2_better:.2f}x"
+      f" | k=2 near MC floor: {near_floor_k2}")
+if SIGN < 0:
+    print("   SUB regime: deep ReLUs die -> output collapses to a point-mass-at-0 mixture. The true mean is")
+    print("   a small fluctuation effect. Read above whether MEAN-PROP (k=1) can estimate it at all, and how")
+    print("   much the k=2 covariance helps (ratio>1) -- vs whether BOTH stay O(1) off (single-Gaussian limit).")
 else:
-    print("   SUB regime: the -sqrt(n)*mu shift drives pre-activations NEGATIVE -> ReLUs DIE -> the output")
-    print("   collapses to a point-mass-at-0 mixture a single Gaussian k=2 state cannot represent -> kprop")
-    print("   fails (flat O(1) error), and the EXACT ReLU covariance does not help (it fixes the wrong term).")
+    print("   ADD regime (control): pre-acts positive -> ReLUs linear -> activations ~Gaussian -> both k=1 and")
+    print("   k=2 should be accurate; here the covariance should add little (the layer is essentially linear).")
 """)
 
 # =============================================================================
@@ -464,23 +422,23 @@ if IN_COLAB:
 md(r"""## §6 — Summary
 
 - **What ran:** random depth-{3,4,5} ReLU MLPs (square, no bias), every hidden weight matrix
-  mean-shifted by $+1/\sqrt n$ — `SHIFT="add"`, $W=W'+\tfrac1{\sqrt n}\mathbf 1\mathbf 1^\top$ (flip to
-  `"sub"` for $-1/\sqrt n$), **no training**; **two** $k{=}2$ predictors — vanilla harmonic and
-  **exact-ReLU-covariance** kprop — vs Monte-Carlo, widths up to 3072 (exact-cov up to `EXACT_COV_MAX_WIDTH`), seeds 1–2.
-- **Mechanism:** for layers $\ell\ge2$ the input is post-ReLU with mean $\mu>0$, so the shared shift is
-  $+\sqrt n\,\mu$ — pre-activations go strongly **positive**, ReLUs sit in their **linear** branch, the
-  activations stay **~Gaussian**, and the $k{=}2$ closure is (near) exact.
-- **Result (§2–§4) — kprop should WORK here:** $\lVert\mu_{\text{kprop}}\rVert$ tracks $\lVert\mu_{\text{MC}}\rVert$
-  (magnitude lines overlap), parity sits on $y=x$ (slope$\approx$corr$\approx1$), and the relative error is
-  **small and decreasing** with width (slope $p<0$ / near the MC floor) — read the printed verdict for the
-  observed numbers. Vanilla and exact-cov coincide (the covariance approximation is irrelevant once linear).
-- **Contrast (`sub`):** the $-1/\sqrt n$ shift kills the ReLUs → output collapses to a point-mass-at-0
-  mixture → kprop fails with a flat $O(1)$ error that the exact covariance can't fix. The two regimes
-  **bracket where a single-Gaussian $k{=}2$ predictor is usable**: linear-regime ✓, dead-regime ✗.
+  mean-shifted by $-1/\sqrt n$ — `SHIFT="sub"`, $W=W'-\tfrac1{\sqrt n}\mathbf 1\mathbf 1^\top$ (flip to
+  `"add"` for the linear-regime control), **no training**; **two budgets** — mean-prop ($k{=}1$, the
+  predictor under test) and covariance kprop ($k{=}2$, reference) — vs Monte-Carlo, widths to 3072, seeds 1–2.
+- **What $k{=}1$ is:** it propagates **only the mean** (degree-1 cumulant), with the degree-2 piece kept
+  as a diagonal metric $\mathrm{diag}(WW^\top)$ — so each ReLU uses an exact *marginal* mean+variance but
+  **no cross-neuron covariance**. $k{=}2$ adds that covariance.
+- **Read off §2–§4:** (i) the **unscaled magnitudes** — does $\lVert\mu_{k1}\rVert$ track
+  $\lVert\mu_{\text{MC}}\rVert$, or over/under-shoot the collapse? (ii) the **parity** — are the
+  per-coordinate means on $y=x$? (iii) the **scaling** — does either error shrink with width, and the
+  printed `median (k1 err / k2 err)` says how much the covariance buys.
+- **Why `sub` is hard:** the $-\sqrt n\,\mu$ shift at depth kills the ReLUs → the output collapses to a
+  point-mass-at-0 mixture whose residual mean is a fluctuation effect a single-Gaussian (let alone
+  mean-only) state may not capture. The `add` control is the easy linear-regime opposite.
 
 **Recycling:** models + MC/kprop results live in `checkpoints/shifted_mean_vanilla_kprop` (keyed by config,
-so `add` and `sub` never mix); re-runs load instead of recomputing, and §5 downloads the dir.
-**GPU:** MC + vanilla kprop run on `E.DEVICE` (CUDA); exact-cov is scipy/CPU.""")
+so `sub`/`add` and different $k$ never mix); re-runs load instead of recomputing, and §5 downloads the dir.
+**GPU:** MC + kprop run on `E.DEVICE` (CUDA), float64-on-CPU fallback on MPS.""")
 
 out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shifted_mean_vanilla_kprop_colab.ipynb")
 nb.save(out)

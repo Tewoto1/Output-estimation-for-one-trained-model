@@ -291,25 +291,36 @@ def reduce_sv(S: np.ndarray, V: np.ndarray, proj: np.ndarray,
 #  torch streamer (lazy import): forward passes -> per-sample scalars         #
 # --------------------------------------------------------------------------- #
 def stream_collective_coordinates(model, input_dim: int, num_samples: int, *,
-                                  layers: Sequence[int] = (0, 1, 2), which: str = "post",
+                                  layers: Sequence[int] = (0, 1, 2),
+                                  whichs: Sequence[str] = ("post",), which: str = None,
                                   n_rand: int = 3, batch: int = 8192,
                                   device=None, dtype=None, input_std: float = 1.0,
                                   data_seed: int = 0, dir_seed: int = 777,
-                                  accum_dtype="float64") -> Dict[int, Dict]:
+                                  accum_dtype="float64") -> Dict[str, Dict[int, Dict]]:
     """Stream x ~ N(0, input_std^2 I) through `model`, collecting per-sample S, V and
-    random-direction projections, plus per-coordinate moments, for each hidden layer.
+    random-direction projections, plus per-coordinate moments, for each requested
+    activation type ("pre" = pre-ReLU W h, "post" = post-ReLU) and each hidden layer,
+    all from a SINGLE forward pass.
 
-    Returns {layer: {"S":(N,), "V":(N,), "proj":(N,n_rand), "coord_moments":(8,n),
-                     "n":n, "which":which}}.  Only the scalar arrays are kept in
-    memory (per-sample), so cost is O(N * (2 + n_rand)) floats per layer.
+    `whichs` is an iterable of {"pre","post"} (scalar `which=` also accepted for
+    backward compat). Returns a nested dict
+        {which: {layer: {"S":(N,), "V":(N,), "proj":(N,n_rand), "coord_moments":(8,n),
+                         "n":n, "which":which}}}.
+    Only per-sample scalars are kept, so cost is O(N*(2+n_rand)) floats per (which,layer).
     """
     import torch
+    if which is not None:                       # backward-compat scalar
+        whichs = (which,)
+    whichs = tuple(whichs)
+    for w in whichs:
+        if w not in ("pre", "post"):
+            raise ValueError(f"which must be 'pre' or 'post'; got {w!r}")
     model.eval()
     dev = device or next(model.parameters()).device
     layers = list(layers)
     n = model.cfg.hidden_dim
 
-    # fixed random unit directions per layer (reproducible, shared across seeds/widths via dir_seed)
+    # fixed random unit directions per layer (shared across whichs/seeds/widths via dir_seed)
     U = {}
     for ell in layers:
         g = torch.Generator(device="cpu").manual_seed(dir_seed + 1009 * ell + n)
@@ -317,8 +328,9 @@ def stream_collective_coordinates(model, input_dim: int, num_samples: int, *,
         Um = Um / Um.norm(dim=0, keepdim=True).clamp_min(1e-30)
         U[ell] = Um.to(dev)
 
-    S = {ell: [] for ell in layers}; Vv = {ell: [] for ell in layers}; PR = {ell: [] for ell in layers}
-    msum = {ell: np.zeros((8, n), dtype=np.float64) for ell in layers}
+    keys = [(w, ell) for w in whichs for ell in layers]
+    S = {k: [] for k in keys}; Vv = {k: [] for k in keys}; PR = {k: [] for k in keys}
+    msum = {k: np.zeros((8, n), dtype=np.float64) for k in keys}
     sqn = float(np.sqrt(n))
     gdata = torch.Generator(device="cpu").manual_seed(data_seed)
     done = 0
@@ -327,17 +339,19 @@ def stream_collective_coordinates(model, input_dim: int, num_samples: int, *,
         x = (torch.randn(b, input_dim, generator=gdata, dtype=torch.float32) * input_std).to(dev)
         with torch.no_grad():
             _, acts = model(x, return_activations=True)
-        for ell in layers:
-            X = acts[which][ell].to(torch.float64)              # (b, n)
-            S[ell].append((X.sum(1)).cpu().numpy())
-            Vv[ell].append((X.pow(2).sum(1) / sqn).cpu().numpy())
-            PR[ell].append((X @ U[ell]).cpu().numpy())           # (b, n_rand)
-            xk = X
-            for k in range(1, 9):                                # per-coordinate moment sums
-                msum[ell][k - 1] += xk.sum(0).cpu().numpy() if k == 1 else (X.pow(k)).sum(0).cpu().numpy()
-    out = {}
-    for ell in layers:
-        out[ell] = dict(S=np.concatenate(S[ell]), V=np.concatenate(Vv[ell]),
-                        proj=np.concatenate(PR[ell], axis=0),
-                        coord_moments=msum[ell] / float(done), n=n, which=which)
+        for w in whichs:
+            for ell in layers:
+                X = acts[w][ell].to(torch.float64)              # (b, n)
+                S[(w, ell)].append((X.sum(1)).cpu().numpy())
+                Vv[(w, ell)].append((X.pow(2).sum(1) / sqn).cpu().numpy())
+                PR[(w, ell)].append((X @ U[ell]).cpu().numpy())  # (b, n_rand)
+                xk = torch.ones_like(X)
+                for k in range(1, 9):                            # per-coordinate moment sums E[X^k]
+                    xk = xk * X
+                    msum[(w, ell)][k - 1] += xk.sum(0).cpu().numpy()
+    out: Dict[str, Dict[int, Dict]] = {w: {} for w in whichs}
+    for (w, ell) in keys:
+        out[w][ell] = dict(S=np.concatenate(S[(w, ell)]), V=np.concatenate(Vv[(w, ell)]),
+                           proj=np.concatenate(PR[(w, ell)], axis=0),
+                           coord_moments=msum[(w, ell)] / float(done), n=n, which=w)
     return out

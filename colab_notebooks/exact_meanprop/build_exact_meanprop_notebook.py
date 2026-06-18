@@ -69,10 +69,15 @@ Results cache under `results/exact_meanprop/`.
 """)
 
 code(r"""
-import os, math, copy, time, json
+import os, math, copy, time, json, logging
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
+
+# The APPROXIMATE k=2 covariance (gain approximation) is not PSD in the dead-ReLU
+# regime and spams "Snapping negative variance to zero"; we default k=2 to the EXACT
+# bivariate covariance (K2_EXACT below). Quiet the warning either way.
+logging.getLogger("Mecha_preds.cumulants.kprop.wick").setLevel(logging.ERROR)
 
 import experiments as E
 from model import MLP, ModelConfig
@@ -91,7 +96,11 @@ QUICK = E.QUICK
 
 # ---- predictors to compare -------------------------------------------------
 INCLUDE_K2    = True                    # covariance-aware reference (O(n^2); see K2_MAX_WIDTH)
-K2_MAX_WIDTH  = 2048                     # skip k=2 above this width (kept tractable)
+K2_EXACT      = True                     # k=2 uses the EXACT bivariate ReLU covariance (PSD, stable).
+                                         # The approximate gain-based k=2 goes NON-PSD in the dead-ReLU
+                                         # "sub" regime -> negative variances snapped by wick -> the
+                                         # prediction blows up (rel ~ 1e5-1e6). Keep True here.
+K2_MAX_WIDTH  = 1024                     # skip k=2 above this width (exact cov is O(n^2) Owen's-T)
 
 # ---- bed A: shifted-weight random MLPs ------------------------------------
 RUN_SHIFTED   = True
@@ -166,7 +175,8 @@ def predict_all(m, w, include_k2):
     out["exact_mp_var"] = np.asarray(emp["out_var"], float)
     out["k1"] = np.asarray(run_cumulants(m, w, {"k_max": 1, "factor": False}, device=KPROP_DEVICE)["mean"], float)
     if include_k2:
-        out["k2"] = np.asarray(run_cumulants(m, w, {"k_max": 2, "factor": False}, device=KPROP_DEVICE)["mean"], float)
+        out["k2"] = np.asarray(run_cumulants(m, w, {"k_max": 2, "factor": False,
+                               "exact_relu_cov": K2_EXACT}, device=KPROP_DEVICE)["mean"], float)
     return out
 
 def mc_reference(m, w):
@@ -217,10 +227,14 @@ def run_bed(tag, model_iter, cfg_sig):
             r = eval_one(m.double().eval(), w, depth, seed, inc_k2)
             cache[key] = r; torch.save(cache, path); src = "computed"
         rows.append(r)
+        emp_n = r.get("exact_mp_norm", float("nan"))
+        collapsed = emp_n < 1e-9 * (r["mc_norm"] + 1e-30)        # predicted ~0 -> rel saturates at 1
         msg = f"   {key:>22} [{src:>8}] exact-mp rel={r.get('exact_mp_rel', float('nan')):.3e}  k1 rel={r.get('k1_rel', float('nan')):.3e}"
         if "k2_rel" in r:
             msg += f"  k2 rel={r['k2_rel']:.3e}"
-        msg += f"  (floor {r['floor_rel']:.1e})"
+        msg += f"  | ||emp||={emp_n:.1e} ||mc||={r['mc_norm']:.1e} (floor {r['floor_rel']:.1e})"
+        if collapsed:
+            msg += "  <- exact-mp COLLAPSED to ~0 (dead ReLUs; rel->1 by construction)"
         print(msg, flush=True)
     print(f"   {tag}: {len(rows)} runs in {time.time()-t0:.1f}s")
     return rows
@@ -233,6 +247,21 @@ md(r"""## 4. Bed A — shifted-weight models  $W=W'+s\,(1/\sqrt n)\mathbf 1\math
 point mass: the regime where a mean-only state is most stressed. `SHIFT="add"` ($s=+1$) keeps ReLUs in
 the ~linear regime (an easy control where mean-prop should be near-exact). The shift is on hidden
 layers only (the readout is linear; shifting it would only inflate $\|E[\mathrm{out}]\|$).
+
+**Expect `exact-mp rel ≈ 1.000` at larger $n$ in the `sub` regime — and that is the exact integral
+being _faithful_, not failing.** The shared shift adds $s\,\tfrac1{\sqrt n}\mathbf 1\mathbf 1^\top$, so
+for $\ell\ge2$ the pre-activation mean is $\approx -\sqrt n\,\bar\mu$ (grows with $\sqrt n$) while
+$\sigma=O(1)$. Then $\alpha=\mu/\sigma\to-\sqrt n$, and the exact moments
+$\mathbb E[\mathrm{ReLU}],\mathrm{Var}[\mathrm{ReLU}]\sim e^{-\alpha^2/2}\to0$ **underflow**: the
+coordinate becomes a dead point mass at $0$, the layer's variance hits $0$, and everything downstream
+is exactly $0$. So exact mean-prop outputs $\mathbf 0$, and $\mathrm{rel}=\lVert\mathbf 0-\mu_{MC}\rVert/\lVert\mu_{MC}\rVert=1$
+**by construction** ($\mathrm{rel}{=}1\Leftrightarrow$ "predicted zero"). The true $\mu_{MC}$ is a tiny
+**nonzero** residual produced entirely by inter-coordinate **correlations**, which any mean-field
+(diagonal) propagator discards — so a more exact _ReLU gate_ cannot recover it; the missing ingredient
+is the **covariance** (the $k{=}2$ exact path below is what closes it). The cruder $k{=}1$ avoids the
+collapse only because its _fixed_ $\mathrm{diag}(WW^\top)$ metric never lets the variance die — its
+nonzero answer is an artifact of that wrong metric, not higher accuracy. Watch $\lVert\text{emp}\rVert$
+vs $\lVert\text{mc}\rVert$ in the log to see the collapse directly.
 """)
 
 code(r"""

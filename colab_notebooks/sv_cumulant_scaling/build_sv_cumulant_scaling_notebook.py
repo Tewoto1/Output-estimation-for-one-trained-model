@@ -24,8 +24,8 @@ md, code = nb.md, nb.code
 # =========================================================================== #
 md(r"""# Cumulant scaling of the collective coordinates $S$ and $V$ on trained-to-0 MLPs
 
-For a hidden **post-ReLU** latent $X\in\mathbb R^n$ (one per input $x\sim\mathcal N(0,I_n)$)
-of a depth-3 square ReLU MLP trained to output $0$, define two scalar collective coordinates
+For a hidden latent $X\in\mathbb R^n$ — **both pre-ReLU ($Wh$) and post-ReLU are analysed**, one per
+input $x\sim\mathcal N(0,I_n)$ — of a depth-3 square ReLU MLP trained to output $0$, define two scalar collective coordinates
 (the **literal** definitions chosen for this study):
 
 $$S=\sum_{i=1}^n X_i \qquad\qquad V=\frac{1}{\sqrt n}\sum_{i=1}^n X_i^2 .$$
@@ -116,7 +116,9 @@ QUICK  = E.QUICK                                     # True on CPU-only -> small
 WIDTHS = [16, 32, 64, 128] if QUICK else [16, 32, 64, 128, 256, 512, 1024, 1536, 2048]
 SEEDS  = [3, 4, 5, 6]
 LAYERS = [0, 1, 2]          # ALL three hidden blocks (h1, h2, h3); h3 feeds the readout
-WHICH  = "post"             # POST-ReLU latents (the layer carrying the -mu / all-ones structure)
+WHICHS = ["post", "pre"]    # latents to analyse: POST-ReLU and PRE-ReLU (Wh), both from ONE forward
+                            # pass. "post" carries the -mu/all-ones structure; "pre" is the
+                            # near-Gaussian input to each ReLU and the layer the shift acts on.
 N_RAND = 3                  # matched random-direction controls per layer
 
 # --- Monte-Carlo & statistics ------------------------------------------------
@@ -128,7 +130,7 @@ Z_GATE   = 2.0                                       # plot kappa only if |kappa
 CACHE_DIR = "results/sv_cumulant_scaling/cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-print(f"device={DEVICE} | widths={WIDTHS} | seeds={SEEDS} | layers(post-ReLU)={LAYERS}")
+print(f"device={DEVICE} | widths={WIDTHS} | seeds={SEEDS} | layers={LAYERS} | activations={WHICHS}")
 print(f"N_MC={N_MC:,} | jackknife blocks={N_BLOCKS} | resolution gate z={Z_GATE}")
 print(f"checkpoints (load-only): {CKPT_DIR}/{PREFIX}_d{DEPTH}_w*_tol{TOL_TAG}_seed*  |  cache: {CACHE_DIR}")
 """)
@@ -176,8 +178,10 @@ code(r"""
 def ckpt_for(w, s):
     return E.ckpt_path(CKPT_DIR, E.run_name(PREFIX, depth=DEPTH, width=w, tol=TOL_TAG, seed=s))
 
+WHICH_TAG = "-".join(WHICHS)
+
 def cache_for(w, s):
-    return os.path.join(CACHE_DIR, f"svcum_d{DEPTH}_w{w}_seed{s}_{WHICH}_N{N_MC}_nr{N_RAND}.json")
+    return os.path.join(CACHE_DIR, f"svcum_d{DEPTH}_w{w}_seed{s}_{WHICH_TAG}_N{N_MC}_nr{N_RAND}.json")
 
 def get_or_compute(w, s):
     cp = cache_for(w, s)
@@ -192,18 +196,20 @@ def get_or_compute(w, s):
     model = model.to(device=DEVICE, dtype=MODEL_DTYPE).eval()
     in_dim   = model.cfg.input_dim
     mc_batch = min(MC_BATCH, max(4096, (1 << 26) // max(in_dim, 1)))   # bound batch*n memory
+    # ONE forward pass yields BOTH pre- and post-activation collective coordinates per layer
     streamed = stream_collective_coordinates(
-        model, in_dim, N_MC, layers=LAYERS, which=WHICH, n_rand=N_RAND,
+        model, in_dim, N_MC, layers=LAYERS, whichs=WHICHS, n_rand=N_RAND,
         batch=mc_batch, device=DEVICE, dtype=MODEL_DTYPE, data_seed=1000 + s)
-    per_layer = {}
-    for ell in LAYERS:
-        d = streamed[ell]
-        per_layer[str(ell)] = reduce_sv(d["S"], d["V"], d["proj"], d["coord_moments"], d["n"],
-                                        n_blocks=N_BLOCKS, z_gate=Z_GATE)
-    per_layer["_meta"] = dict(width=w, seed=s, final_loss=float(E.final_loss(payload)), N_MC=N_MC)
+    rec = {}
+    for which in WHICHS:
+        for ell in LAYERS:
+            d = streamed[which][ell]
+            rec[f"{which}|{ell}"] = reduce_sv(d["S"], d["V"], d["proj"], d["coord_moments"], d["n"],
+                                              n_blocks=N_BLOCKS, z_gate=Z_GATE)
+    rec["_meta"] = dict(width=w, seed=s, final_loss=float(E.final_loss(payload)), N_MC=N_MC)
     with open(cp, "w") as f:
-        json.dump(per_layer, f)
-    return per_layer, False
+        json.dump(rec, f)
+    return rec, False
 
 RESULTS = {}
 t0 = time.time()
@@ -225,10 +231,11 @@ jackknife SD with the seed-to-seed spread. A cumulant is **resolved** when $\lve
 """)
 
 code(r"""
-def aggregate(layer):
+def aggregate(which, layer):
     out = {}
     for w in WIDTHS:
-        seeds = [RESULTS[(w, s)][str(layer)] for s in SEEDS if (w, s) in RESULTS]
+        seeds = [RESULTS[(w, s)][f"{which}|{layer}"] for s in SEEDS
+                 if (w, s) in RESULTS and f"{which}|{layer}" in RESULTS[(w, s)]]
         if not seeds:
             continue
         Nseed = len(seeds)
@@ -254,10 +261,12 @@ def aggregate(layer):
         out[w] = row
     return out
 
-AGG = {ell: aggregate(ell) for ell in LAYERS}
+AGG = {(which, ell): aggregate(which, ell) for which in WHICHS for ell in LAYERS}
 LCOL = {0: "#1f77b4", 1: "#2ca02c", 2: "#d62728"}                 # per-layer colour
 LNAME = {ell: f"h{ell+1}{' (readout-feeding)' if ell == max(LAYERS) else ''}" for ell in LAYERS}
-print("aggregated layers:", {ell: list(AGG[ell].keys()) for ell in LAYERS})
+WHLABEL = {"post": "post-ReLU", "pre": "pre-ReLU (Wh)"}
+print("aggregated (activation, layer) -> #widths:",
+      {f"{which}|h{ell+1}": len(AGG[(which, ell)]) for which in WHICHS for ell in LAYERS})
 """)
 
 # --------------------------------------------------------------------------- #
@@ -271,10 +280,10 @@ peeling *above* its dashed null = inter-coordinate correlation** (expected for t
 """)
 
 code(r"""
-def _xy(layer, key, want_resolved):
-    ws = sorted(AGG[layer].keys()); xs, ys, sg = [], [], []
+def _xy(which, layer, key, want_resolved):
+    agg = AGG[(which, layer)]; ws = sorted(agg.keys()); xs, ys, sg = [], [], []
     for w in ws:
-        r = AGG[layer][w]
+        r = agg[w]
         if r[f"res_{key}"] != want_resolved:
             continue
         v = r[f"k_{key}"]
@@ -283,54 +292,103 @@ def _xy(layer, key, want_resolved):
         xs.append(w); ys.append(abs(v)); sg.append(np.sign(v))
     return np.array(xs, float), np.array(ys, float), np.array(sg, float)
 
-def _diag_xy(layer, key):
-    ws = sorted(AGG[layer].keys()); xs, ys = [], []
+def _diag_xy(which, layer, key):
+    agg = AGG[(which, layer)]; ws = sorted(agg.keys()); xs, ys = [], []
     for w in ws:
-        v = AGG[layer][w][f"diag_{key}"]
+        v = agg[w][f"diag_{key}"]
         if v != 0:
             xs.append(w); ys.append(abs(v))
     return np.array(xs, float), np.array(ys, float)
 
-fig, axes = plt.subplots(4, 3, figsize=(16, 18)); axes = axes.ravel()
-for idx, ab in enumerate(AB_REPORT):
-    a, b = ab; key = f"{a}{b}"; ax = axes[idx]
-    txt = []
+def plot_scaling(which):
+    fig, axes = plt.subplots(4, 3, figsize=(16, 18)); axes = axes.ravel()
+    for idx, ab in enumerate(AB_REPORT):
+        a, b = ab; key = f"{a}{b}"; ax = axes[idx]
+        txt = []
+        for ell in LAYERS:
+            col = LCOL[ell]
+            for resolved, ms, fill in [(True, 90, True), (False, 55, False)]:
+                xs, ys, sg = _xy(which, ell, key, resolved)
+                for mk, sel in [("^", sg > 0), ("v", sg < 0)]:
+                    if sel.any():
+                        ax.scatter(xs[sel], ys[sel], s=ms, marker=mk,
+                                   facecolors=(col if fill else "none"), edgecolors=col,
+                                   linewidths=1.4, zorder=3)
+            xs, ys, sg = _xy(which, ell, key, True)
+            if xs.size:
+                o = np.argsort(xs); ax.plot(xs[o], ys[o], "-", color=col, lw=1.2, alpha=0.7,
+                                            label=f"{LNAME[ell]} (meas)")
+                sl = fit_loglog_slope(xs, ys)
+            else:
+                sl = float("nan")
+            dx, dy = _diag_xy(which, ell, key)
+            if dx.size:
+                o = np.argsort(dx); ax.plot(dx[o], dy[o], "--", color=col, lw=1.3, alpha=0.9)
+            txt.append(f"{LNAME[ell].split()[0]}: meas {sl:+.2f}")
+        ax.set_xscale("log"); ax.set_yscale("log")
+        ax.set_title(f"$\\kappa_{{{a},{b}}}$  (#S={a}, #V={b})", fontsize=12)
+        ax.set_xlabel("width $n$"); ax.set_ylabel(f"$|\\kappa_{{{a},{b}}}|$")
+        pl, ph = predicted_slope_literal(a, b), predicted_slope_heuristic(a, b)
+        ax.text(0.03, 0.03, "predicted slope\n  literal $1-b/2$ = %+.2f\n  heuristic = %+.2f\n%s"
+                % (pl, ph, "\n".join(txt)), transform=ax.transAxes, fontsize=8,
+                va="bottom", ha="left", bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
+        if idx == 0:
+            ax.legend(fontsize=8, loc="upper left")
+    fig.suptitle(f"[{WHLABEL[which]}]  width scaling of $|\\kappa_{{a,b}}(S,V)|$  "
+                 "(markers = measured, filled = resolved; dashed = iid/diagonal null)",
+                 fontsize=13, y=0.995)
+    fig.tight_layout(rect=[0, 0, 1, 0.985]); plt.show()
+
+for _w in WHICHS:
+    plot_scaling(_w)
+""")
+
+# --------------------------------------------------------------------------- #
+md(r"""## 5b. Pre- vs post-activation scale, side by side
+
+The direct comparison you want: $|\kappa_{a,b}|$ vs width for **pre-ReLU** ($Wh$, dashed/squares) and
+**post-ReLU** (solid/circles), coloured by layer, for the pure-$S$ ($\kappa_{2,0},\kappa_{3,0},\kappa_{4,0}$)
+and pure-$V$ ($\kappa_{0,2},\kappa_{0,3}$) cumulants (resolved points only). Pre-activations are the
+near-Gaussian sums feeding each ReLU and are exactly where the all-ones shift acts; post-activations are
+the rectified outputs. Reading the two together shows how much of the cumulant scale is created by the
+ReLU vs already present in the pre-activation.
+""")
+
+code(r"""
+from matplotlib.lines import Line2D
+
+def _meas_xy(which, ell, key):
+    agg = AGG[(which, ell)]; ws = sorted(agg.keys()); xs, ys = [], []
+    for w in ws:
+        r = agg[w]
+        if not r[f"res_{key}"]:
+            continue
+        v = r[f"k_{key}"]
+        if v != 0:
+            xs.append(w); ys.append(abs(v))
+    return np.array(xs, float), np.array(ys, float)
+
+WHSTYLE = {"post": "-", "pre": "--"}; WHMK = {"post": "o", "pre": "s"}
+panels = [(2, 0), (3, 0), (4, 0), (0, 2), (0, 3)]
+fig, axes = plt.subplots(2, 3, figsize=(16, 9)); axes = axes.ravel()
+for idx, (a, b) in enumerate(panels):
+    ax = axes[idx]; key = f"{a}{b}"
     for ell in LAYERS:
-        col = LCOL[ell]
-        # measured, split by sign and resolution
-        for resolved, ms, fill in [(True, 90, True), (False, 55, False)]:
-            xs, ys, sg = _xy(ell, key, resolved)
-            for mk, sel in [("^", sg > 0), ("v", sg < 0)]:
-                if sel.any():
-                    ax.scatter(xs[sel], ys[sel], s=ms, marker=mk,
-                               facecolors=(col if fill else "none"), edgecolors=col,
-                               linewidths=1.4, zorder=3)
-        # measured connecting line over RESOLVED points only
-        xs, ys, sg = _xy(ell, key, True)
-        if xs.size:
-            o = np.argsort(xs); ax.plot(xs[o], ys[o], "-", color=col, lw=1.2, alpha=0.7,
-                                        label=f"{LNAME[ell]} (meas)")
-            sl = fit_loglog_slope(xs, ys)
-        else:
-            sl = float("nan")
-        # diagonal / iid reference
-        dx, dy = _diag_xy(ell, key)
-        if dx.size:
-            o = np.argsort(dx); ax.plot(dx[o], dy[o], "--", color=col, lw=1.3, alpha=0.9)
-        txt.append(f"{LNAME[ell].split()[0]}: meas {sl:+.2f}")
+        for which in WHICHS:
+            xs, ys = _meas_xy(which, ell, key)
+            if xs.size:
+                o = np.argsort(xs)
+                ax.plot(xs[o], ys[o], WHSTYLE.get(which, "-"), marker=WHMK.get(which, "o"),
+                        color=LCOL[ell], lw=1.3, ms=5, alpha=0.85)
     ax.set_xscale("log"); ax.set_yscale("log")
-    ax.set_title(f"$\\kappa_{{{a},{b}}}$  (#S={a}, #V={b})", fontsize=12)
+    ax.set_title(f"$|\\kappa_{{{a},{b}}}|$  (#S={a}, #V={b})")
     ax.set_xlabel("width $n$"); ax.set_ylabel(f"$|\\kappa_{{{a},{b}}}|$")
-    pl, ph = predicted_slope_literal(a, b), predicted_slope_heuristic(a, b)
-    ax.text(0.03, 0.03, "predicted slope\n  literal $1-b/2$ = %+.2f\n  heuristic = %+.2f\n%s"
-            % (pl, ph, "\n".join(txt)), transform=ax.transAxes, fontsize=8,
-            va="bottom", ha="left", bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
-    if idx == 0:
-        ax.legend(fontsize=8, loc="upper left")
-fig.suptitle("Width scaling of joint cumulants $|\\kappa_{a,b}(S,V)|$  "
-             "(solid+markers = measured, filled = resolved; dashed = iid/diagonal null)",
-             fontsize=13, y=0.995)
-fig.tight_layout(rect=[0, 0, 1, 0.985]); plt.show()
+axes[-1].axis("off")
+handles = [Line2D([0], [0], color=LCOL[ell], lw=2, label=LNAME[ell]) for ell in LAYERS] + \
+          [Line2D([0], [0], color="0.3", ls=WHSTYLE[w], marker=WHMK[w], label=WHLABEL[w]) for w in WHICHS]
+axes[-1].legend(handles=handles, loc="center", fontsize=11, title="colour = layer, style = activation")
+fig.suptitle("Pre- vs post-activation cumulant scale (resolved points only)", y=1.0)
+fig.tight_layout(); plt.show()
 """)
 
 # --------------------------------------------------------------------------- #
@@ -342,21 +400,25 @@ direction makes $\kappa_{2,0}$ enhancement scale $\propto n$; higher orders grow
 """)
 
 code(r"""
-fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
-for j, a in enumerate((2, 3, 4)):
-    ax = axes[j]
-    for ell in LAYERS:
-        ws = sorted(AGG[ell].keys())
-        y  = [AGG[ell][w][f"enh_k{a}"] for w in ws]
-        ax.plot(ws, np.abs(y), "o-", color=LCOL[ell], label=LNAME[ell])
-    ax.axhline(1.0, color="0.5", ls=":", lw=1)
-    ax.set_xscale("log"); ax.set_yscale("log")
-    ax.set_xlabel("width $n$"); ax.set_ylabel(f"$|\\kappa_{{{a},0}}|$ measured / diagonal")
-    ax.set_title(f"enhancement of $\\kappa_{{{a},0}}$ (S only)")
-    if j == 0:
-        ax.legend(fontsize=9)
-fig.suptitle("Inter-coordinate correlation: how far the all-ones cumulants sit above the iid null", y=1.02)
-fig.tight_layout(); plt.show()
+def plot_enh(which):
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
+    for j, a in enumerate((2, 3, 4)):
+        ax = axes[j]
+        for ell in LAYERS:
+            ws = sorted(AGG[(which, ell)].keys())
+            y  = [AGG[(which, ell)][w][f"enh_k{a}"] for w in ws]
+            ax.plot(ws, np.abs(y), "o-", color=LCOL[ell], label=LNAME[ell])
+        ax.axhline(1.0, color="0.5", ls=":", lw=1)
+        ax.set_xscale("log"); ax.set_yscale("log")
+        ax.set_xlabel("width $n$"); ax.set_ylabel(f"$|\\kappa_{{{a},0}}|$ measured / diagonal")
+        ax.set_title(f"enhancement of $\\kappa_{{{a},0}}$ (S only)")
+        if j == 0:
+            ax.legend(fontsize=9)
+    fig.suptitle(f"[{WHLABEL[which]}] inter-coordinate correlation: all-ones cumulants above the iid null", y=1.02)
+    fig.tight_layout(); plt.show()
+
+for _w in WHICHS:
+    plot_enh(_w)
 """)
 
 # --------------------------------------------------------------------------- #
@@ -368,21 +430,25 @@ all-ones direction specifically — the signature of the trained $-\mu$ spike, n
 """)
 
 code(r"""
-fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
-for j, a in enumerate((2, 3, 4)):
-    ax = axes[j]
-    for ell in LAYERS:
-        ws = sorted(AGG[ell].keys())
-        y  = [AGG[ell][w][f"SvsR_k{a}"] for w in ws]
-        ax.plot(ws, np.abs(y), "s-", color=LCOL[ell], label=LNAME[ell])
-    ax.axhline(1.0, color="0.5", ls=":", lw=1)
-    ax.set_xscale("log"); ax.set_yscale("log")
-    ax.set_xlabel("width $n$"); ax.set_ylabel(f"$|\\kappa_{a}(S)| / |\\kappa_{a}(R_{{rand}})|$")
-    ax.set_title(f"all-ones vs random direction, order {a}")
-    if j == 0:
-        ax.legend(fontsize=9)
-fig.suptitle("All-ones direction vs a matched random direction (ratio $\\gg1$ ⇒ coherence is the all-ones mode)", y=1.02)
-fig.tight_layout(); plt.show()
+def plot_svr(which):
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
+    for j, a in enumerate((2, 3, 4)):
+        ax = axes[j]
+        for ell in LAYERS:
+            ws = sorted(AGG[(which, ell)].keys())
+            y  = [AGG[(which, ell)][w][f"SvsR_k{a}"] for w in ws]
+            ax.plot(ws, np.abs(y), "s-", color=LCOL[ell], label=LNAME[ell])
+        ax.axhline(1.0, color="0.5", ls=":", lw=1)
+        ax.set_xscale("log"); ax.set_yscale("log")
+        ax.set_xlabel("width $n$"); ax.set_ylabel(f"$|\\kappa_{a}(S)| / |\\kappa_{a}(R_{{rand}})|$")
+        ax.set_title(f"all-ones vs random direction, order {a}")
+        if j == 0:
+            ax.legend(fontsize=9)
+    fig.suptitle(f"[{WHLABEL[which]}] all-ones vs matched random direction (ratio $\\gg1$ ⇒ all-ones mode)", y=1.02)
+    fig.tight_layout(); plt.show()
+
+for _w in WHICHS:
+    plot_svr(_w)
 """)
 
 # --------------------------------------------------------------------------- #
@@ -396,46 +462,57 @@ $\operatorname{Var}(S)/\sum\operatorname{Var}(X_i)$ grows $\propto n$.
 """)
 
 code(r"""
-fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
-for ell in LAYERS:
-    ws = sorted(AGG[ell].keys()); col = LCOL[ell]
-    axes[0].plot(ws, [AGG[ell][w]["twopoint_offdiag_frac"] for w in ws], "o-", color=col, label=LNAME[ell])
-    axes[1].plot(ws, [abs(AGG[ell][w]["twopoint_n_times_mean_cov"]) for w in ws], "o-", color=col)
-    ratio = [AGG[ell][w]["twopoint_var_S"]/max(AGG[ell][w]["twopoint_diag_var"], 1e-30) for w in ws]
-    axes[2].plot(ws, np.abs(ratio), "o-", color=col)
-axes[0].axhline(0, color="0.5", ls=":"); axes[0].set_ylabel("off-diagonal fraction of Var(S)")
-axes[0].set_title("share of Var(S) from correlation"); axes[0].set_xscale("log"); axes[0].legend(fontsize=9)
-axes[1].set_ylabel(r"$|(n-1)\,\overline{Cov}|$"); axes[1].set_title("democratic-correlation test (flat ⇒ $O(1/n)$)")
-axes[1].set_xscale("log"); axes[1].set_yscale("log")
-axes[2].set_ylabel("Var(S) / sum Var(X_i)"); axes[2].set_title("coherent enhancement (∝ n ⇒ rank-1)")
-axes[2].set_xscale("log"); axes[2].set_yscale("log")
-for ax in axes:
-    ax.set_xlabel("width $n$")
-fig.tight_layout(); plt.show()
+def plot_twopoint(which):
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
+    for ell in LAYERS:
+        ws = sorted(AGG[(which, ell)].keys()); col = LCOL[ell]; agg = AGG[(which, ell)]
+        axes[0].plot(ws, [agg[w]["twopoint_offdiag_frac"] for w in ws], "o-", color=col, label=LNAME[ell])
+        axes[1].plot(ws, [abs(agg[w]["twopoint_n_times_mean_cov"]) for w in ws], "o-", color=col)
+        ratio = [agg[w]["twopoint_var_S"]/max(agg[w]["twopoint_diag_var"], 1e-30) for w in ws]
+        axes[2].plot(ws, np.abs(ratio), "o-", color=col)
+    axes[0].axhline(0, color="0.5", ls=":"); axes[0].set_ylabel("off-diagonal fraction of Var(S)")
+    axes[0].set_title("share of Var(S) from correlation"); axes[0].set_xscale("log"); axes[0].legend(fontsize=9)
+    axes[1].set_ylabel(r"$|(n-1)\,\overline{Cov}|$"); axes[1].set_title("democratic-correlation test (flat ⇒ $O(1/n)$)")
+    axes[1].set_xscale("log"); axes[1].set_yscale("log")
+    axes[2].set_ylabel("Var(S) / sum Var(X_i)"); axes[2].set_title("coherent enhancement (∝ n ⇒ rank-1)")
+    axes[2].set_xscale("log"); axes[2].set_yscale("log")
+    for ax in axes:
+        ax.set_xlabel("width $n$")
+    fig.suptitle(f"[{WHLABEL[which]}] 2-point structure of Var(S)", y=1.03)
+    fig.tight_layout(); plt.show()
+
+for _w in WHICHS:
+    plot_twopoint(_w)
 """)
 
 # --------------------------------------------------------------------------- #
 md(r"""## 9. Per-coordinate (marginal) non-Gaussianity
 
-The individual $X_i$ are post-ReLU, so they are one-sided and non-Gaussian by construction. Median
-skewness, excess kurtosis, and the dead-ReLU fraction vs width characterise how the *marginals* drift —
-the diagonal reference already folds these in, so the §5–§8 gaps are correlation **beyond** marginal
-non-Gaussianity.
+Median skewness, excess kurtosis, and the near-degenerate ($\mathrm{Var}(X_i)\approx0$) fraction vs
+width. **Post-ReLU** coordinates are one-sided → positive skew, non-zero excess kurtosis; **pre-ReLU**
+coordinates are sums ($Wh$) and should be much closer to Gaussian (skew, excess kurtosis $\approx0$) —
+a useful contrast. The diagonal reference already folds these marginals in, so the §5–§8 gaps are
+correlation **beyond** marginal non-Gaussianity.
 """)
 
 code(r"""
-fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
-for ell in LAYERS:
-    ws = sorted(AGG[ell].keys()); col = LCOL[ell]
-    axes[0].plot(ws, [AGG[ell][w]["marg_skew_med"]   for w in ws], "o-", color=col, label=LNAME[ell])
-    axes[1].plot(ws, [AGG[ell][w]["marg_exkurt_med"] for w in ws], "o-", color=col)
-    axes[2].plot(ws, [AGG[ell][w]["dead_frac"]       for w in ws], "o-", color=col)
-axes[0].set_title("median skewness of $X_i$"); axes[0].legend(fontsize=9)
-axes[1].set_title("median excess kurtosis of $X_i$")
-axes[2].set_title("dead-ReLU fraction (Var$(X_i)\\approx0$)")
-for ax, yl in zip(axes, ("skewness", "excess kurtosis", "dead fraction")):
-    ax.set_xlabel("width $n$"); ax.set_ylabel(yl); ax.set_xscale("log")
-fig.tight_layout(); plt.show()
+def plot_marg(which):
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.6))
+    for ell in LAYERS:
+        ws = sorted(AGG[(which, ell)].keys()); col = LCOL[ell]; agg = AGG[(which, ell)]
+        axes[0].plot(ws, [agg[w]["marg_skew_med"]   for w in ws], "o-", color=col, label=LNAME[ell])
+        axes[1].plot(ws, [agg[w]["marg_exkurt_med"] for w in ws], "o-", color=col)
+        axes[2].plot(ws, [agg[w]["dead_frac"]       for w in ws], "o-", color=col)
+    axes[0].set_title("median skewness of $X_i$"); axes[0].legend(fontsize=9)
+    axes[1].set_title("median excess kurtosis of $X_i$")
+    axes[2].set_title(r"near-degenerate fraction (Var$(X_i)\approx0$)")
+    for ax, yl in zip(axes, ("skewness", "excess kurtosis", "degenerate fraction")):
+        ax.set_xlabel("width $n$"); ax.set_ylabel(yl); ax.set_xscale("log")
+    fig.suptitle(f"[{WHLABEL[which]}] per-coordinate marginal shape", y=1.03)
+    fig.tight_layout(); plt.show()
+
+for _w in WHICHS:
+    plot_marg(_w)
 """)
 
 # --------------------------------------------------------------------------- #
@@ -447,35 +524,40 @@ $z={}$`Z_GATE` (unresolved widths are excluded from the fit and not plotted as f
 """)
 
 code(r"""
-def slope_over_resolved(layer, key, which="k"):
-    ws = sorted(AGG[layer].keys()); xs, ys = [], []
+def slope_over_resolved(which, layer, key, field="k"):
+    agg = AGG[(which, layer)]; ws = sorted(agg.keys()); xs, ys = [], []
     for w in ws:
-        r = AGG[layer][w]
-        if which == "k" and not r[f"res_{key}"]:
+        r = agg[w]
+        if field == "k" and not r[f"res_{key}"]:
             continue
-        v = r[f"{which}_{key}"]
+        v = r[f"{field}_{key}"]
         if v != 0:
             xs.append(w); ys.append(abs(v))
     return fit_loglog_slope(xs, ys), len(xs)
 
-print(f"{'(a,b)':7s} {'layer':6s} {'meas slope':>10s} {'diag slope':>10s} "
-      f"{'lit 1-b/2':>9s} {'heur':>6s} {'nres':>5s}")
-print("-" * 60)
-for ab in AB_REPORT:
-    a, b = ab; key = f"{a}{b}"
+def slope_table(which):
+    print(f"================  {WHLABEL[which]}  ================")
+    print(f"{'(a,b)':7s} {'layer':6s} {'meas slope':>10s} {'diag slope':>10s} "
+          f"{'lit 1-b/2':>9s} {'heur':>6s} {'nres':>5s}")
+    print("-" * 60)
+    for ab in AB_REPORT:
+        a, b = ab; key = f"{a}{b}"
+        for ell in LAYERS:
+            ms, nres = slope_over_resolved(which, ell, key, "k")
+            ds, _    = slope_over_resolved(which, ell, key, "diag")
+            print(f"({a},{b})   {LNAME[ell].split()[0]:5s} {ms:>10.2f} {ds:>10.2f} "
+                  f"{predicted_slope_literal(a,b):>9.2f} {predicted_slope_heuristic(a,b):>6.2f} {nres:>5d}")
+        print()
+    print("Gated-out (unresolved at z=%.1f) [layer: (a,b)@width ...]:" % Z_GATE)
     for ell in LAYERS:
-        ms, nres = slope_over_resolved(ell, key, "k")
-        ds, _    = slope_over_resolved(ell, key, "diag")
-        print(f"({a},{b})   {LNAME[ell].split()[0]:5s} {ms:>10.2f} {ds:>10.2f} "
-              f"{predicted_slope_literal(a,b):>9.2f} {predicted_slope_heuristic(a,b):>6.2f} {nres:>5d}")
+        agg = AGG[(which, ell)]
+        gated = [f"({a},{b})@{w}" for w in sorted(agg.keys())
+                 for (a, b) in AB_REPORT if not agg[w][f"res_{a}{b}"]]
+        print(f"  {LNAME[ell].split()[0]}: {', '.join(gated) if gated else 'none — all resolved'}")
     print()
 
-# which (a,b, n) cells were gated out (not resolved)
-print("Gated-out (unresolved at z=%.1f) cells [layer: (a,b)@width ...]:" % Z_GATE)
-for ell in LAYERS:
-    gated = [f"({a},{b})@{w}" for w in sorted(AGG[ell].keys())
-             for (a, b) in AB_REPORT if not AGG[ell][w][f"res_{a}{b}"]]
-    print(f"  {LNAME[ell].split()[0]}: {', '.join(gated) if gated else 'none — all resolved'}")
+for _w in WHICHS:
+    slope_table(_w)
 """)
 
 # --------------------------------------------------------------------------- #
@@ -491,10 +573,16 @@ md(r"""## 11. How to read this
   as expected. The deepest (readout-feeding) layer $h3$ should show this most strongly.
 * **Mixed $\kappa_{a,b}$** interpolate; a non-zero, resolved, growing $\kappa_{2,1},\kappa_{1,2}$ beyond
   the diagonal null means $S$ and $V$ fluctuations are coupled through the same coherent mode.
+* **Pre- vs post-activation (§5b and the per-activation panels).** Pre-activations $Wh$ are the
+  near-Gaussian sums feeding each ReLU and are exactly where the all-ones shift is injected, so the
+  coherent $\kappa_{a,0}$ enhancement is typically *already present* (often cleaner) in the pre-acts;
+  the ReLU then rectifies it into the post-acts. Pre-act marginals are near-Gaussian (§9 skew/kurt
+  $\approx0$) while post-acts are one-sided — yet both share the same all-ones correlation, which is the
+  point: the coherence is a weight-geometry effect, not a ReLU artifact.
 * Anything plotted **hollow** is inside the sampling noise ($\lvert\kappa\rvert<2\,\mathrm{sd}$) — don't
   read a slope into it. Raise `N_MC` to resolve the 4th-order tails, or lower the widths considered.
 
-To probe a single layer / pre-activations / a different gate, edit the §1 knobs (`WHICH="pre"`,
+To analyse only one activation / a different gate, edit the §1 knobs (`WHICHS=["post"]` or `["pre"]`,
 `LAYERS`, `Z_GATE`, `N_MC`) and re-run — cached cells reload, only new settings recompute.
 """)
 

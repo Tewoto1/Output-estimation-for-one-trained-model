@@ -164,37 +164,41 @@ def linear_step(st: State, W: np.ndarray, b: Optional[np.ndarray],
 
 
 # --------------------------------------------------------------------------- #
-# special-mode quadrature  (Gaussian for R=2; Gram-Charlier reweight for R>=3)
+# special-mode Edgeworth quadrature  (the summation of the tracked cumulants)
 # --------------------------------------------------------------------------- #
 def special_mode_quadrature(d1: float, vS: float, d: Dict[int, float], R: int,
                             n_nodes: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Positive quadrature for the special mode S (mean d1, var vS, cumulants d3..dR).
+    """Edgeworth / Gram-Charlier quadrature for the special mode S (paper eq 21).
 
-    Uses the Cornish-Fisher expansion: keep the strictly-positive Gauss-Hermite
-    weights but MAP the standardized nodes z so the rule matches the tracked
-    cumulants. With skew g1 = kappa3/vS^{3/2} and excess kurtosis g2 = kappa4/vS^2,
+    The nonlinear step is NOT the exact Gaussian-ReLU integral -- that would assume the
+    special mode is Gaussian. Instead it is the finite Edgeworth/Gram-Charlier closure:
+    every tracked higher cumulant lives along the special direction u
+    (``kappa_{i_1..i_p} = d_p u_{i_1}..u_{i_p}``), so the order-R operator
+    ``exp_{<=R}( sum_{p>=3} d_p/p! (u.d/dx)^p )`` acting on the Gaussian-ReLU moment is
+    realized EXACTLY as Gauss-Hermite nodes for the Gaussian part N(d1, vS) reweighted by
+    the truncated Edgeworth series
 
-        x = z + (g1/6)(z^2-1) + (g2/24)(z^3-3z) - (g1^2/36)(2z^3-5z),
-        s = d1 + sqrt(vS) * x.
+        w_k = w_GH_k * [ 1 + (g1/6) He_3(xi_k) + (g2/24) He_4(xi_k) ],
+        g1 = d3 / vS^{3/2}  (skewness),   g2 = d4 / vS^2  (excess kurtosis),
 
-    R=2 -> Gaussian special mode (no skew); R=3 adds skew; R=4 adds kurtosis. This is
-    the quantile form of the finite cumulant closure (paper eq 21): positive weights,
-    so the covariance built from it stays PSD, and it is far more stable than the
-    Gram-Charlier density series when the amplified special mode is strongly skewed.
+    with xi_k the standardized node. R=2 -> no correction (Gaussian special mode); R=3
+    adds the skew term; R=4 adds the kurtosis term. The weights are SIGNED (the Edgeworth
+    measure is not a probability measure) -- that is the literal cumulant summation. The
+    weights still sum to 1 exactly (Gauss-Hermite integrates He_3, He_4 to zero), so no
+    renormalization. The exact Gaussian-ReLU integral is then used only on the conditional
+    transverse law, which IS Gaussian in this closure.
     """
     t, om = hermgauss(n_nodes)
     sig = np.sqrt(max(vS, 0.0))
+    s = d1 + np.sqrt(2.0) * sig * t
     w = om / np.sqrt(np.pi)
-    w = w / w.sum()
-    z = np.sqrt(2.0) * t
-    x = z.copy()
+    w = w / w.sum()                                 # base Gaussian weights (sum 1)
     if R >= 3 and sig > 0 and d:
-        g1 = d.get(3, 0.0) / (sig ** 3)
-        x = x + (g1 / 6.0) * (z ** 2 - 1.0)
+        xi = np.sqrt(2.0) * t                       # standardized nodes (s-d1)/sig
+        fac = np.ones_like(xi) + (d.get(3, 0.0) / sig ** 3 / 6.0) * _He(3, xi)
         if R >= 4:
-            g2 = d.get(4, 0.0) / (sig ** 4)
-            x = x + (g2 / 24.0) * (z ** 3 - 3.0 * z) - (g1 * g1 / 36.0) * (2.0 * z ** 3 - 5.0 * z)
-    s = d1 + sig * x
+            fac = fac + (d.get(4, 0.0) / sig ** 4 / 24.0) * _He(4, xi)
+        w = w * fac                                 # Edgeworth weights (signed; still sum to 1)
     return s, w
 
 
@@ -202,14 +206,20 @@ def special_mode_quadrature(d1: float, vS: float, d: Dict[int, float], R: int,
 # ReLU step  (exact rank-2 per node + mixing; paper sec 6)
 # --------------------------------------------------------------------------- #
 def relu_step(st: State, R: int, n_nodes: int) -> State:
-    """Propagate the split state through coordinatewise ReLU.
+    """Propagate the split state through coordinatewise ReLU (paper eq 21).
 
     Condition on the special mode S; the conditional law given S=s is Gaussian with
-    mean shifted by ``c_vec*(s-d1)`` and an s-independent covariance ``Sig_cond``. We
-    run the exact rank-2 Gaussian-ReLU per node and mix. The covariance/next state is
-    mixed with the strictly-positive Gaussian weights (so it stays a valid PSD
-    covariance); the mean and the forwarded special cumulants use the Gram-Charlier
-    weights, which inject the amplified special non-Gaussianity (d3..dR).
+    mean shifted by ``c_vec*(s-d1)`` and an s-independent covariance ``Sig_cond``. The
+    exact rank-2 Gaussian-ReLU integral is applied ONLY to that conditional transverse
+    law (which is Gaussian in this closure); the special mode's non-Gaussianity is
+    carried by the SIGNED Edgeworth/Gram-Charlier weights of
+    ``special_mode_quadrature`` -- i.e. the moments are the Edgeworth SUMMATION of the
+    tracked special cumulants (d3..dR), not an assumed-Gaussian integral.
+
+    Because the Edgeworth weights are signed, the mixed covariance can lose positive-
+    definiteness for R>=3; we project the transverse block back to PSD (its u-row/col is
+    re-zeroed) so it remains a valid covariance to propagate. R=2 has positive weights
+    and skips the projection.
     """
     n, u = st.n, st.u
     d1, vS = st.d1, st.vS
@@ -223,6 +233,10 @@ def relu_step(st: State, R: int, n_nodes: int) -> State:
         Sig_cond = st.Sig_perp.copy()
         s_nodes = np.array([d1]); w = np.array([1.0])
     Sig_cond = 0.5 * (Sig_cond + Sig_cond.T)
+    if R >= 3:                                      # signed Edgeworth weights upstream can make the
+        vals, vecs = np.linalg.eigh(Sig_cond)       # joint covariance invalid -> project the ReLU input
+        Sig_cond = (vecs * np.clip(vals, 0.0, None)) @ vecs.T  # back to PSD (it is well-conditioned: no spike)
+        Sig_cond = 0.5 * (Sig_cond + Sig_cond.T)
 
     part_cond = np.zeros((n, n))                   # sum_k w_k Cov(X | s_k)
     rm_list: List[np.ndarray] = []                 # conditional means E[X | s_k]
@@ -249,6 +263,7 @@ def relu_step(st: State, R: int, n_nodes: int) -> State:
     g_X = Sig_u - vS_X * u
     g_X = g_X - float(u @ g_X) * u
     Sig_perp_X = 0.5 * (Sig_perp_X + Sig_perp_X.T)
+    vS_X = max(vS_X, 0.0)
 
     # forward the higher special cumulants: cumulants of {r_k = u.E[X|s_k], w_k}
     d_X: Dict[int, float] = {}

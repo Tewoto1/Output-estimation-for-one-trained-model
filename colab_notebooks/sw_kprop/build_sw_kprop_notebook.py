@@ -10,7 +10,7 @@ K-Propagation with Special-Direction Cumulants" -- on the two regimes asked for:
 
 For each model we compare, against a Monte-Carlo mean:
   * SW-KPROP at output rank R in {2,3,4} (R=2 = exact rank-2 Gaussian-ReLU in the
-    split basis; R>=3 adds the amplified special cumulants d3,d4 via Cornish-Fisher);
+    split basis; R>=3 adds the amplified special cumulants d3,d4 via the Edgeworth summation);
   * the existing exact-K2 kprop (run_cumulants k_max=2, exact_relu_cov=True) as the
     "total-order" baseline SW-KPROP is meant to beat on the shifted model.
 
@@ -52,7 +52,8 @@ special direction to **output rank $R$** and the transverse covariance **dense a
   transverse block (the dense congruence $M\,\Sigma_\perp M^\top$ is the only $O(n^3)$ work → GPU).
 - **ReLU step** — condition on the scalar special mode $S=u^\top Z$, run the **exact** rank-2
   Gaussian-ReLU per Gauss–Hermite node, mix. $R{=}2$ ⇒ Gaussian $S$ (exact rank-2, $\tau{=}0$);
-  $R{\ge}3$ ⇒ Cornish–Fisher nodes carrying $d_3,d_4$ (the amplified non-Gaussianity).
+  $R{\ge}3$ ⇒ the **Edgeworth/Gram–Charlier summation** injecting $d_3,d_4$ — Gaussian-ReLU nodes
+  reweighted by $[1+\tfrac{\gamma_1}{6}He_3+\tfrac{\gamma_2}{24}He_4]$, *not* an assumed-Gaussian integral.
 
 **The knob $R$.** $R{=}2$ is the exact rank-2 closure; $R{=}3,4$ add the special cumulants. We sweep
 all three and compare to the existing **exact-K2 kprop** (the total-order baseline).
@@ -62,7 +63,7 @@ all three and compare to the existing **exact-K2 kprop** (the total-order baseli
 | **§0** | torch-free self-check | linear step & rank-2 ReLU exact to machine precision; depth-1 mean exact vs MC |
 | **§2** | shifted model: $\lVert E[\text{out}]\rVert$ **and** rel-error vs width, per $R$ | does adding $R$ pull the prediction toward MC? does SW-KPROP beat exact-K2? |
 | **§3** | trained-to-0 checkpoints: rel-error vs width, per $R$ | SW-KPROP $R{=}2$ ≈ exact-K2 (no special structure); is anything gained? |
-| **§4** | error-vs-$R$ summary + the **death (`sub`) regime** | $R$ helps monotonically; `sub` collapses to $\approx0$ — the no-go-lemma stress test |
+| **§4** | error-vs-$R$ summary + the **death (`sub`) regime** | $R$ helps on `add`/trained-0; on `sub` the Edgeworth series diverges (no-go-lemma stress test) |
 
 > **`sub` is the stress test.** For $s{=}-1$ the post-ReLU special mode $S_{X}=u^\top\!\mathrm{ReLU}(Z)\ge 0$
 > is *one-signed*, and $S_Z=a\,S_X\le 0$ kills every deeper ReLU → the output **collapses to $\approx 0$**.
@@ -320,13 +321,16 @@ md(r"""## §4 — Error vs rank $R$, and the death-regime reading
 The bars show the relative error at the largest width of each regime as $R$ grows. Read it as: **does
 keeping more of the amplified special direction help?**
 
-- **`add` & trained-to-0:** SW-KPROP is accurate; $R$ helps monotonically (`add`) or is already at the
-  rank-2 floor (trained-to-0). SW-KPROP $R{=}2 \approx$ exact-K2 — the faithful-generalization check.
-- **`sub` (death):** the output collapses to $\approx0$, so the **relative** error is huge for *every*
-  closure (you are dividing by $\approx0$); the honest signal is the **magnitude** panel in §2 — each
-  higher $R$ pulls $\lVert\mu_{\rm pred}\rVert$ down toward the collapsed truth. Finite cumulants cannot
-  fully represent the one-signed special mode (the paper's no-go Lemma 2), so a residual remains; this is
-  the known hard stress test, not a bug.""")
+- **`add` & trained-to-0:** SW-KPROP is accurate; the Edgeworth corrections help **monotonically** with
+  $R$ (`add`), or are correctly inert at the rank-2 floor (trained-to-0, no special non-Gaussianity).
+  SW-KPROP $R{=}2 \approx$ exact-K2 — the faithful-generalization check.
+- **`sub` (death):** the output collapses to $\approx0$ (relative error is huge for *every* closure —
+  you divide by $\approx0$). Here the special mode is strongly **one-signed** (skewness $O(1)$), so the
+  truncated Edgeworth series of eq 21 **does not converge**: $R{=}3$ can overshoot by orders of magnitude
+  and $R{=}4$ swing back. That is the textbook Gram–Charlier/Edgeworth divergence for large
+  non-Gaussianity — i.e. exactly the no-go regime (Lemma 2): no finite cumulant list determines the ReLU
+  cumulants of this law. It is the known hard stress test, and the honest reading is *that the Edgeworth
+  closure breaks here*, not that it converges to the truth.""")
 code(r"""
 def at_max_width(rows, wkey="w"):
     wmax = max(r[wkey] for r in rows); return [r for r in rows if r[wkey] == wmax][0], wmax
@@ -347,7 +351,7 @@ ax.set_yscale("log"); ax.set_xticks(x + 0.4 - bw/2); ax.set_xticklabels(labels)
 ax.set_ylabel("relative error vs MC (log)"); ax.set_title("error vs rank R, by regime (largest width)")
 ax.legend(fontsize=8); ax.grid(alpha=0.3, axis="y", which="both"); plt.tight_layout(); plt.show()
 
-print("magnitude collapse in the death (sub) regime — does higher R pull ||pred|| toward ||MC||?")
+print("magnitude in the death (sub) regime — note the Edgeworth series does NOT settle (R3 overshoots):")
 for r in [r for r in sh_rows if r["shift"] == "sub"]:
     msg = "  ".join(f"R{R} {r[f'sw_R{R}_norm']:.2e}" for R in R_VALUES)
     print(f"  w={r['w']:>4}: ||MC||={r['mc_norm']:.2e} | {msg} | k2 {r['k2_norm']:.2e}")
@@ -378,9 +382,9 @@ md(r"""## §6 — Summary
 - **SW-KPROP $R{=}2$** is the exact rank-2 closure in the split (special/transverse) basis: linear step
   exact, ReLU step the exact bivariate-Gaussian integral — it equals exact-K2 kprop where the special
   direction is irrelevant (trained-to-0), and is exact at depth 1.
-- **$R{\ge}3$** adds the $\sqrt n$-amplified special cumulants $d_3,d_4$ (Cornish–Fisher quadrature of
-  the special mode): it helps monotonically in the `add` regime and pulls the predicted magnitude toward
-  the collapsed truth in `sub`.
+- **$R{\ge}3$** adds the $\sqrt n$-amplified special cumulants $d_3,d_4$ via the **Edgeworth/Gram–Charlier
+  summation** over the special mode (eq 21): it helps monotonically in the `add` regime, is inert on
+  trained-to-0, and **diverges in the strong-skew `sub` regime** (the known Edgeworth non-convergence).
 - **The `sub` death regime** is the no-go stress test: the output collapses to $\approx0$, so relative
   error stays large for any finite-cumulant closure; §2's magnitude panel is the honest readout.
 - **Self-check (§0):** linear & rank-2 ReLU steps are exact to machine precision; depth-1 mean is exact

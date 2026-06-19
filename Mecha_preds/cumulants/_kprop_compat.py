@@ -1,6 +1,6 @@
-"""_compat.py -- let the vendored kprop import on Python < 3.12 WITHOUT editing it.
+"""_kprop_compat.py -- let the vendored kprop import on Python < 3.12 WITHOUT editing it.
 
-The vendored ``..kprop`` library is copied verbatim from the ARC paper repo and
+The vendored ``.kprop`` library is copied verbatim from the ARC paper repo and
 must stay byte-for-byte pristine (see the repo README: "vendored, unmodified").
 It targets Python >= 3.12 and uses two constructs older interpreters reject:
 
@@ -9,16 +9,16 @@ It targets Python >= 3.12 and uses two constructs older interpreters reject:
   * ``from typing import Self``      (``typing.Self`` only exists on 3.11+)
 
 Rather than patch those into the vendored files (which is exactly the change we
-reverted), this shim -- owned by ``skprop``, the spike-aware predictor that
-depends on kprop -- installs a source-rewriting import hook that downgrades the
+reverted), this shim installs a source-rewriting import hook that downgrades the
 syntax *in memory* as each kprop module is loaded. The files on disk are never
 touched.
 
-On Python >= 3.12 ``install()`` is a no-op: the vendored code parses natively and
-this module is never even imported (``Mecha_preds.cumulants.__init__`` guards the
-call behind a version check). So this has zero effect on the repo's real runtime
-(the project .venv is 3.13); it only makes the 3.10/3.11 sandbox able to run
-skprop end-to-end.
+This is general kprop infrastructure (it used to live in the now-removed
+``skprop`` predictor). On Python >= 3.12 ``install()`` is a no-op: the vendored
+code parses natively and this module is never even imported
+(``Mecha_preds.cumulants.__init__`` guards the call behind a version check). So
+this has zero effect on the repo's real runtime (the project .venv is 3.13); it
+only makes the 3.10/3.11 sandbox / Colab able to run kprop end-to-end.
 """
 from __future__ import annotations
 
@@ -30,9 +30,9 @@ import re
 import sys
 
 # Fully-qualified name + on-disk directory of the vendored kprop package.
-# __name__ == "Mecha_preds.cumulants.skprop._compat"  ->  pkg "Mecha_preds.cumulants"
-_KPROP_PKG = __name__.rsplit(".", 2)[0] + ".kprop"
-_KPROP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kprop")
+# __name__ == "Mecha_preds.cumulants._kprop_compat"  ->  pkg "Mecha_preds.cumulants"
+_KPROP_PKG = __name__.rsplit(".", 1)[0] + ".kprop"
+_KPROP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kprop")
 
 # A PEP 695 alias line:  <indent> type NAME [params]? = RHS
 _TYPE_RE = re.compile(

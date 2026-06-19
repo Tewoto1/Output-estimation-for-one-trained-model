@@ -16,7 +16,7 @@ experiments.py    ALL experiment knobs: sweep grids, per-width budgets, checkpoi
 model/            the MLP under study (one class, all activations, checkpoint load/save)
 checkpoints/      trained .pt files (self-describing: config + weights + history)
   noiseless_Layerless/          frozen/trainable-readout + meanfield grids
-  weight_analysis_checkpoints/  halfspace / max / zerobias dissection models
+  kprop_checkpoints/            trained-to-0 d3 models (widths 16-2048, seeds 3-6)
 tasks/            task definitions + losses: train-to-zero, single half-space, distillation
 training/         the training loop (Trainer/TrainConfig) + a grid-runner CLI
 analysis/         circuit tools (analysis/Tools/, re-exported at package level)

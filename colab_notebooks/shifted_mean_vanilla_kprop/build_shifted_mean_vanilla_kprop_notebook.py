@@ -36,7 +36,7 @@ REPO POLICIES: recycling (MC + kprop cached by config under checkpoints/shifted_
 models saved too; nothing recomputed on a re-run); GPU (MC + kprop on E.DEVICE; float64 falls back
 to CPU on Apple MPS).
 
-Needs Python >= 3.12 OR the skprop kprop-compat shim (auto-active on import); + torch.
+Needs Python >= 3.12 OR the kprop-compat shim (auto-active on import); + torch.
 Run:  python "colab_notebooks/shifted_mean_vanilla_kprop/build_shifted_mean_vanilla_kprop_notebook.py"
 """
 import os
@@ -92,7 +92,7 @@ width to 3072 ($k{=}2$ is the $n\times n$ covariance; $k{\ge}3$ is an $n^3$ tens
 | **§4** | **cumulant fidelity, layer by layer** — propagated $\kappa_1$ (mean) & $\kappa_2$ (covariance) vs MC, **exact** vs vanilla $k{=}2$ | is exact $k{=}2$ accurate on the cumulants? *where* do they drift; does exact track the off-diagonal? |
 | **§5** | fit $\text{error}\propto n^{\,p}$, per predictor | does either error shrink with width, or stay $O(1)$? how much does covariance buy? |
 
-Needs Python ≥ 3.12 *or* the skprop kprop-compat shim (auto-active on import), plus torch.""")
+Needs Python ≥ 3.12 *or* the kprop-compat shim (auto-active on import), plus torch.""")
 
 code(BOOTSTRAP_CELL)
 

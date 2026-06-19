@@ -19,7 +19,7 @@ from .Tools import (
     direct_contributions, output_lens, cumulants_sv,
 )
 from .Tools.weight_structure import (
-    mean_prev_post, weight_structure_metrics, W_last, W_first,
+    mean_prev_post, weight_structure_metrics, delta_weight_metrics, W_last, W_first,
     layer_stats, grad_flow,
 )
 from .Tools.cumulants_sv import (
@@ -33,7 +33,7 @@ __all__ = [
     "ablate", "neuron_importance",
     "activation_patch",
     "direct_contributions", "output_lens",
-    "mean_prev_post", "weight_structure_metrics", "W_last", "W_first",
+    "mean_prev_post", "weight_structure_metrics", "delta_weight_metrics", "W_last", "W_first",
     "layer_stats", "grad_flow", "cumulants_sv",
     "reduce_sv", "stream_collective_coordinates", "AB_REPORT",
     "predicted_slope_literal", "predicted_slope_heuristic", "fit_loglog_slope",

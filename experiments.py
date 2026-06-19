@@ -86,8 +86,9 @@ def default_train_cfg(width: int, seed: int = 0, **overrides) -> TrainConfig:
 # Each notebook declares its own CKPT_DIR (e.g. "checkpoints/noiseless_Layerless")
 # in its config cell; experiments.py only standardizes file NAMING and recycling.
 # Existing folders: checkpoints/noiseless_Layerless (frozen/trainable readout +
-# meanfield), checkpoints/weight_analysis_checkpoints (halfspace/max/zerobias),
-# checkpoints/kprop_tol_checkpoints (kprop train-to-tolerance scaling).
+# meanfield) and checkpoints/kprop_checkpoints (kprop train-to-tolerance, trained-to-0
+# d3 widths 16-2048). Notebooks create their own dirs on demand (e.g.
+# weight_analysis_checkpoints, shifted_mean_vanilla_kprop).
 # ---------------------------------------------------------------------------
 def run_name(prefix: str, *, depth: int, width: int, seed: int = 0,
              **extras) -> str:

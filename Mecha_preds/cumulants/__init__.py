@@ -15,12 +15,12 @@ ReLU covariance at ``k_max==2`` (``config={"k_max": 2, "exact_relu_cov": True}``
 comparison (`compare_means`); `run_comparison` is the width-sweep CLI.
 """
 # The vendored kprop targets Python >= 3.12. On older interpreters, activate the
-# source-rewrite import shim owned by skprop BEFORE importing the adapter (which
-# imports kprop). This keeps kprop/ pristine; on >=3.12 the block is skipped and
-# skprop is not eagerly imported, so production behaviour is unchanged.
+# source-rewrite import shim BEFORE importing the adapter (which imports kprop).
+# This keeps kprop/ pristine; on >=3.12 the block is skipped, so production
+# behaviour is unchanged.
 import sys as _sys
 if _sys.version_info < (3, 12):
-    from .skprop._compat import install as _install_kprop_compat
+    from ._kprop_compat import install as _install_kprop_compat
     _install_kprop_compat()
 del _sys
 
@@ -40,11 +40,6 @@ __all__ = [
     "run_exact_meanprop", "relu_gaussian_moments",
 ]
 
-# Structured power KPROP (spike-aware: latent conditioning + power-cumulant
-# residual) lives in ``.skprop`` -- import from there to keep this namespace
-# stable:  from Mecha_preds.cumulants.skprop import run_structured_cumulants
-#
-# Symbolic hidden-mode KPROP (the hidden mode carried symbolically as polynomial
-# jets instead of averaged over quadrature nodes; scalar h, k_max=2) lives in
-# ``.shkprop`` -- it has NO kprop dependency (torch+numpy only), so import it
-# directly:  from Mecha_preds.cumulants.shkprop import run_symbolic_cumulants
+# Shifted-weight KPROP (the newest predictor: exact rank-2 plus Edgeworth special
+# cumulants for the all-ones / -1/sqrt(n) weight shift) lives in ``.swkprop``:
+#     from Mecha_preds.cumulants.swkprop import run_sw_kprop

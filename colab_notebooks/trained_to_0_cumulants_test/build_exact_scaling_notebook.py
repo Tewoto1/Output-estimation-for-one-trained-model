@@ -233,7 +233,7 @@ BATCH_SIZE = 1024
 LR         = 1e-4     # gentle rate so the loss GLIDES into the tolerance instead of
                       # crashing orders of magnitude past it between two checks
 LOG_EVERY  = 10       # fine-grained history -> usable loss curves in §5b
-CKPT_DIR   = "checkpoints/kprop_tol_checkpoints"   # THIS notebook's checkpoint folder
+CKPT_DIR   = "checkpoints/kprop_checkpoints"   # THIS notebook's checkpoint folder
 TOL_TAG    = int(round(-math.log10(LOSS_TOL)))   # 1e-5 -> 5, goes into the run name
 
 # ---- Monte-Carlo -------------------------------------------------------------
@@ -281,7 +281,7 @@ md(r"""## 5. The width-scaling sweep — parallel seeds, recycled checkpoints
 For each width: evaluate the 4 seeds at init, then **train all 4 seeds to tolerance
 in ONE vmapped loop** (`E.get_or_train_many` → `training.train_ensemble`; exactly
 equivalent to 4 independent Adam runs, ~4× faster on GPU). Trained models are
-checkpointed under `checkpoints/kprop_tol_checkpoints/`, so re-running this cell
+checkpointed under `checkpoints/kprop_checkpoints/`, so re-running this cell
 (or resuming a dead Colab session) loads instead of retraining. A model whose final
 loss is still above `LOSS_TOL` hit the step cap and is flagged **NOT CONVERGED**.
 

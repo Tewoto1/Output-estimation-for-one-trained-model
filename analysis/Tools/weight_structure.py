@@ -52,6 +52,65 @@ def weight_structure_metrics(W, mu) -> Dict[str, float]:
     )
 
 
+def _skew(x) -> float:
+    """Third standardized moment (no scipy dependency)."""
+    x = np.asarray(x, float).reshape(-1)
+    m, s = x.mean(), x.std()
+    return float(((x - m) ** 3).mean() / (s ** 3 + 1e-30))
+
+
+def delta_weight_metrics(W_trained, W_init) -> Dict[str, float]:
+    """Metrics on the weight MOVEMENT ΔW = W_trained − W_init of ONE matrix, for the
+    trained-to-0 study. Tests three hypotheses about how training reshapes the weights:
+
+      (a) entries shift NEGATIVE by ~ 1/√(fan_in): `mean_entry` < 0 and
+          `mean_entry_x_sqrtn` = mean·√n ≈ −1 would mean every entry moved by −1/√n.
+      (b) the movement is skewed negative (more, and larger, negative steps than
+          positive): `frac_negative` > .5, `neg_energy_frac` > `pos_energy_frac`, `skew` < 0.
+      (c) rows pick up a SHARED component (an all-ones / rank-1 spike): the mean
+          off-diagonal row·row dot product > 0, and a sizable fraction of ΔW's energy
+          lies along the all-ones column direction (1/√n)·1 (`allones_energy_frac`).
+
+    `n` = fan_in (columns of W) sets the 1/√n scale. Pass float64 arrays/tensors.
+    """
+    W = np.asarray(W_trained, float)
+    Wi = np.asarray(W_init, float)
+    dW = W - Wi
+    d_out, n = dW.shape
+    sqrtn = np.sqrt(n)
+    flat = dW.reshape(-1)
+    sq_tot = float((flat ** 2).sum()) + 1e-30
+    neg, pos = flat[flat < 0], flat[flat > 0]
+    # Row dot products without forming the d_out×d_out Gram: Σ_{i,j}<r_i,r_j> = ‖Σ_i r_i‖²,
+    # trace = ‖ΔW‖_F², so mean off-diagonal = (‖colsum‖² − ‖ΔW‖_F²)/(d_out²−d_out).
+    colsum = dW.sum(axis=0)                           # Σ_i row_i  (length n)
+    sum_all = float(colsum @ colsum)                  # Σ_{i,j} <row_i, row_j>
+    mean_offdiag_rowdot = ((sum_all - sq_tot) / (d_out * (d_out - 1))) if d_out > 1 else 0.0
+    mean_diag_rowdot = sq_tot / d_out                 # = mean ‖row_i‖²
+    ones = np.ones(n) / sqrtn
+    row_proj = dW @ ones                              # each row's (1/√n)·1 component
+    return dict(
+        n=int(n), d_out=int(d_out),
+        # (a) negative shift, measured in units of 1/√n
+        mean_entry=float(dW.mean()),
+        mean_entry_x_sqrtn=float(dW.mean() * sqrtn),  # ≈ −1 if every entry moved by −1/√n
+        # (b) negative skew of the movement (count + variance + shape)
+        frac_negative=float((flat < 0).mean()),
+        neg_energy_frac=float((neg ** 2).sum() / sq_tot),   # variance share from neg-moving weights
+        pos_energy_frac=float((pos ** 2).sum() / sq_tot),
+        mean_negative=float(neg.mean()) if neg.size else 0.0,
+        mean_positive=float(pos.mean()) if pos.size else 0.0,
+        skew=_skew(flat),
+        # (c) shared-row component / all-ones spike
+        mean_offdiag_rowdot=float(mean_offdiag_rowdot),
+        mean_diag_rowdot=float(mean_diag_rowdot),
+        allones_energy_frac=float((row_proj ** 2).sum() / sq_tot),  # ΔW energy along (1/√n)·1
+        # spectrum
+        top_sv=float(np.linalg.svd(dW, compute_uv=False)[0]),
+        fro=float(np.sqrt(sq_tot)),
+    )
+
+
 def W_last(model) -> torch.Tensor:
     """The pre-readout weight matrix (last hidden layer), on CPU."""
     return model.hidden_layers[model.cfg.depth - 1].weight.detach().cpu()

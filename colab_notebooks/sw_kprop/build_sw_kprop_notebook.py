@@ -71,7 +71,7 @@ all three and compare to the existing **exact-K2 kprop** (the total-order baseli
 > paper's no-go Lemma 2). Expect $R$ to help a lot but the collapse to remain hard; `add` and
 > trained-to-0 are where SW-KPROP is accurate.
 
-Needs Python ≥ 3.12 *or* the skprop kprop-compat shim (auto-active on import), plus torch & scipy.""")
+Needs Python ≥ 3.12 *or* the kprop-compat shim (auto-active on import), plus torch & scipy.""")
 
 code(BOOTSTRAP_CELL)
 

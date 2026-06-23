@@ -40,6 +40,9 @@ __all__ = [
     "run_exact_meanprop", "relu_gaussian_moments",
 ]
 
-# Shifted-weight KPROP (the newest predictor: exact rank-2 plus Edgeworth special
-# cumulants for the all-ones / -1/sqrt(n) weight shift) lives in ``.swkprop``:
+# Shifted-weight KPROP (exact rank-2 plus Edgeworth special cumulants for the all-ones /
+# -1/sqrt(n) weight shift) lives in ``.swkprop``:
 #     from Mecha_preds.cumulants.swkprop import run_sw_kprop
+# SPIKE-KPROP generalizes it to an ARBITRARY unit spike direction v (e.g. localized e1 or
+# flat 1/sqrt(n) 1) for the O(1)-eigenvalue spike M = W' + theta v v^T; lives in ``.spikekprop``:
+#     from Mecha_preds.cumulants.spikekprop import run_spike_kprop

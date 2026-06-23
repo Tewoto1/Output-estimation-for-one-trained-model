@@ -16,6 +16,7 @@ start here.
 | **Checkpoint FOLDER + per-experiment knobs** | each notebook's config cell | `CKPT_DIR = "checkpoints/kprop_checkpoints"`, `WIDTHS`, `LOSS_TOL` |
 | **Predictor (kprop) knobs** | `Mecha_preds/cumulants/adapter.py` | `k_max`, `exact_relu_cov` |
 | **Shifted-weight kprop (swkprop) knobs** | `Mecha_preds/cumulants/swkprop/adapter.py` | `R` (2 = exact rank-2; 3/4 add Edgeworth special cumulants), `n_gh` |
+| **Spike kprop (spikekprop) knobs** | `Mecha_preds/cumulants/spikekprop/adapter.py` | `spike_dir` (`"e1"`/`"ones"`/vector), `R` (2/3/4), `n_nodes` (coordinate spikes want ≥~41) |
 | **Analysis tools** | `analysis/Tools/` | `weight_spectrum`, `weight_structure_metrics`, … |
 
 Rule of thumb: **`experiments.py` holds the classic defaults and the machinery
@@ -121,6 +122,7 @@ no global registry):
 | `checkpoints/weight_analysis_checkpoints/` | mech-interp notebook — halfspace / max / zerobias dissection models |
 | `checkpoints/kprop_checkpoints/` | kprop scaling notebook — train-to-tolerance regime (`_tol5` = MSE < 1e-5, d3, widths 16–2048, seeds 3–6); the trained-to-0 set the SVD/weight-structure notebook reuses |
 | `checkpoints/shifted_mean_vanilla_kprop/` | shifted-mean **vanilla-kprop scaling** notebook — random `W = W' − (1/√n)11ᵀ` models (`shifted-invsqrtn`, shift on **hidden** layers, **no training**), d3–5, widths 64–3072, seeds 1–2 + a per-config `results_*.pt` cache of MC/vanilla-kprop predictions (recycled, downloadable) |
+| `checkpoints/spike_kprop/` | **spike-kprop** notebook — random **O(1)-eigenvalue** spiked models `M = W' + θ vvᵀ` (θ=1, hidden layers, **no training**) in two directions `spike-e1` (localized) / `spike-ones` (flat), d3, widths 64–512, seeds 1–2 + a per-config `results_*.pt` cache (MC + ordinary-kprop + spike-kprop). Tests the trace-projection theorem: flat = resolvable, localized = needs spike-direction cumulants |
 
 Checkpoints are self-describing `.pt` files: `model_config`, `state_dict`, `step`,
 `history`, `final_loss`, `train_config` (+ any `extra_meta`). Load with
@@ -154,6 +156,14 @@ see §6 of the frozen-readout notebook.
    rank-2 ReLU case (`config={"R": 2}` ≡ exact-K2), and `R=3`/`R=4` add the special-mode
    d3/d4 cumulants via an Edgeworth / Gram–Charlier reweight. Validation + usage:
    `colab_notebooks/sw_kprop/`.
+6. **A small O(1)-eigenvalue spike in *any* direction (localized `e1` or flat `ones`)?**
+   Use SPIKE-KPROP: `from Mecha_preds.cumulants.spikekprop import run_spike_kprop` —
+   `run_spike_kprop(model, spike_dir="e1"|"ones"|vector, config={"R": 4, "n_nodes": 61})`.
+   It generalizes swkprop to an arbitrary unit spike direction `v` for `M = W' + θ vvᵀ`
+   (`|θ| ≤ n^{o(1)}`), retaining the spike-direction cumulants `C(v,…,v)=κ_p(S)` to order
+   `R` (the trace-projection terms). `spike_dir="ones"` reproduces swkprop. **Coordinate
+   spikes (`e1`) need more Gauss–Hermite nodes** — the special mode is a ReLU input, so its
+   kink is integrated numerically. Validation + usage: `colab_notebooks/spike_kprop/`.
 
 ## 6. Gotchas
 

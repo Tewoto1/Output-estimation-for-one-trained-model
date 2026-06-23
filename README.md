@@ -23,6 +23,8 @@ analysis/         circuit tools (analysis/Tools/, re-exported at package level)
 Mecha_preds/      mechanistic predictors
   cumulants/        cumulant propagation as a predictor (+ exact ReLU-covariance variant)
     kprop/            the vendored kprop algorithm (from the ARC paper repo)
+    swkprop/          shifted-weight kprop: all-ones special direction, √n weight shift
+    spikekprop/       spike kprop: ANY unit spike direction v, O(1)-eigenvalue spike M=W'+θvvᵀ
 colab_notebooks/  generated notebooks + their build_*.py generators (+ shared _nb.py)
 utils.py          device / seeding / numpy helpers
 ```
@@ -125,6 +127,19 @@ pred_exact = run_cumulants(model, config={"k_max": 2, "exact_relu_cov": True})["
 `exact_relu_cov=True` (ReLU, `k_max==2` only) uses the exact bivariate-Gaussian ReLU
 covariance instead of the leading-order gain approximation. For any other
 `k_max`/activation the normal harmonic kprop runs.
+
+For a **rank-one spike** `M = W' + θ vvᵀ` in the weights there are two split-basis
+predictors that keep the spike-direction cumulants ordinary kprop truncates away:
+
+```python
+from Mecha_preds.cumulants.swkprop  import run_sw_kprop      # all-ones, √n shift (eigenvalue √n)
+from Mecha_preds.cumulants.spikekprop import run_spike_kprop  # any direction, O(1) eigenvalue
+pred = run_spike_kprop(model, spike_dir="e1", config={"R": 4, "n_nodes": 61})["mean"]
+```
+
+`spikekprop` generalizes `swkprop` to an arbitrary unit spike direction `v` (`"e1"` localized,
+`"ones"` flat, or a vector) for the `|θ| ≤ n^{o(1)}` regime, retaining `C(v,…,v)=κ_p(S)` to
+order `R`. `spike_dir="ones"` reproduces `swkprop`.
 
 Sweep cumulant-vs-Monte-Carlo error across widths (trains via the unified loop, writes
 CSV + plots to `--outdir`):

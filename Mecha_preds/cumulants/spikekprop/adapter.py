@@ -28,9 +28,11 @@ from .core import spike_kprop_predict
 
 def default_spike_kprop_config() -> dict:
     """SPIKE-KPROP knobs. ``R`` = highest spike-direction cumulant kept (2 = exact rank-2
-    Gaussian-ReLU; 3 adds d3 = C(v,v,v); 4 adds d4 = C(v,v,v,v) via the Gram-Charlier closure).
-    ``n_nodes`` = Gauss-Hermite nodes for the special mode S = v . X."""
-    return {"R": 2, "n_nodes": 9, "input_std": 1.0}
+    Gaussian-ReLU; 3 adds d3 = C(v,v,v); 4 adds d4 = C(v,v,v,v) via the Edgeworth/Wick closure).
+    ``relu_method``: ``"edgeworth"`` (default) = analytic Gauss-Hermite-FREE Wick summation;
+    ``"gh"`` = legacy Gauss-Hermite quadrature (regression only). ``n_nodes`` is used only when
+    ``relu_method == "gh"`` (the analytic path takes no nodes)."""
+    return {"R": 2, "relu_method": "edgeworth", "n_nodes": 9, "input_std": 1.0}
 
 
 def config_summary(spike_dir, config: Optional[dict] = None) -> str:
@@ -38,7 +40,8 @@ def config_summary(spike_dir, config: Optional[dict] = None) -> str:
     if config:
         c.update(config)
     d = spike_dir if isinstance(spike_dir, str) else "custom"
-    return f"SPIKE-KPROP(dir={d}, R={c['R']}, n_nodes={c['n_nodes']})"
+    tail = f", n_nodes={c['n_nodes']}" if c.get("relu_method") == "gh" else ""
+    return f"SPIKE-KPROP(dir={d}, R={c['R']}, relu={c.get('relu_method', 'edgeworth')}{tail})"
 
 
 def _weights_from_model(model):
@@ -93,6 +96,7 @@ def run_spike_kprop(model, spike_dir="e1", input_dim: Optional[int] = None,
     mm = _make_mm(device)
     res = spike_kprop_predict(weights, input_dim, spike_dir, R=int(cfg["R"]),
                               n_nodes=int(cfg["n_nodes"]), input_std=float(cfg["input_std"]),
+                              relu_method=str(cfg.get("relu_method", "edgeworth")),
                               mm=mm, collect=collect)
     res["metadata"]["device"] = str(device)
     res["metadata"]["config"] = config_summary(spike_dir, config)

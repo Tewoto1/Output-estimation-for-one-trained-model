@@ -74,15 +74,19 @@ The core is numpy-only (scipy for the ReLU integrals, reused from ``swkprop.relu
 """
 from __future__ import annotations
 
+import math
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from numpy.polynomial.hermite import hermgauss
 
 # Reuse SW-KPROP's validated, direction-independent Gaussian-ReLU kernel (numpy/scipy).
-from ..swkprop.relu import relu_moments_1d, exact_relu_covariance
+# ``_phi``/``_Phi`` are the scipy-backed standard-normal pdf/cdf used everywhere here, so
+# the analytic Wick coefficients below match ``kprop.wick.relu_wick_coef`` numerically.
+from ..swkprop.relu import relu_moments_1d, exact_relu_covariance, _phi, _Phi
 
 _TINY = 1e-30
+_VAR_FLOOR = 1e-12
 
 
 # --------------------------------------------------------------------------- #
@@ -226,7 +230,10 @@ def linear_step(st: State, W: np.ndarray, b: Optional[np.ndarray],
 
 
 # --------------------------------------------------------------------------- #
-# special-mode Edgeworth quadrature  (the summation of the tracked cumulants)
+# LEGACY special-mode Gauss-Hermite quadrature.
+# Retained ONLY as a regression reference (the analytic ``relu_step_edgeworth``
+# below is the active ReLU step; see handoff Test 2, which compares the analytic
+# mean against this GH path at a high node count). NOT used by spike_kprop_predict.
 # --------------------------------------------------------------------------- #
 def special_mode_quadrature(d1: float, vS: float, d: Dict[int, float], R: int,
                             n_nodes: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -253,7 +260,8 @@ def special_mode_quadrature(d1: float, vS: float, d: Dict[int, float], R: int,
 
 
 # --------------------------------------------------------------------------- #
-# ReLU step  (exact rank-2 per node + mixing)
+# LEGACY ReLU step  (exact rank-2 per Gauss-Hermite node + mixing).
+# Kept for regression tests only; ``relu_step_edgeworth`` is the active step.
 # --------------------------------------------------------------------------- #
 def relu_step(st: State, R: int, n_nodes: int) -> State:
     """Propagate the split state through coordinatewise ReLU.
@@ -321,12 +329,317 @@ def relu_step(st: State, R: int, n_nodes: int) -> State:
     return State(n, u, mu=mu_X, vS=vS_X, g=g_X, Sig_perp=Sig_perp_X, d=d_X)
 
 
+# =========================================================================== #
+# ANALYTIC EDGEWORTH / WICK ReLU STEP  (GH-FREE -- the active ReLU step)
+# =========================================================================== #
+# The special scalar mode  S = u . X  carries cumulants  d_p = kappa_p(S).  For a
+# ReLU observable  G,  the truncated Edgeworth/Wick summation replaces the old
+# Gauss-Hermite quadrature with a FINITE analytic sum:
+#
+#     E[G(X)] = E_G[G(X_G)] + sum_{p=3..R} d_p/p! * E_G[(c.grad)^p G(X_G)]
+#
+# with loading  c = Sigma u / vS = u + g/vS  and  X_G ~ N(mu, Sigma).  This is the
+# Edgeworth density form turned into the Wick derivative form by Gaussian
+# integration by parts (Stein/Hermite identity); no special_mode_quadrature, no
+# Gauss-Hermite nodes, and no signed-weight PSD pathology -- the only error is the
+# dropped d5+ truncation.  G = rho(X_i) needs the univariate coefficients
+# E_G[rho^(p)(Z_i)] (same closed forms as kprop.wick.relu_wick_coef); the raw
+# second moment G = rho(X_i)rho(X_j) needs the bivariate coefficients
+# B[a,b] = E_G[rho^(a)(Z_i) rho^(b)(Z_j)], derived by conditioning (handoff 5-7).
+
+
+def _relu_wick_uni(mu: np.ndarray, var: np.ndarray, k: int) -> np.ndarray:
+    """``E_G[ rho^(k)(Z) ]`` for ``Z ~ N(mu, var)``, coordinatewise (numpy, k=0..4).
+
+    Closed forms (probabilists' Hermite), identical to ``kprop.wick.relu_wick_coef``::
+
+        k=0: sig phi(a) + mu Phi(a)     k=1: Phi(a)            k=2: phi(a)/sig
+        k=3: -a phi(a)/sig^2            k=4: (a^2-1) phi(a)/sig^3      a = mu/sig
+
+    A tiny variance floor keeps the distributional derivatives finite (handoff 3, opt. A).
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    var = np.clip(np.asarray(var, dtype=np.float64), _VAR_FLOOR, None)
+    sig = np.sqrt(var)
+    a = mu / sig
+    ph, Ph = _phi(a), _Phi(a)
+    if k == 0:
+        return sig * ph + mu * Ph
+    if k == 1:
+        return Ph
+    if k == 2:
+        return ph / sig
+    if k == 3:
+        return -a * ph / sig ** 2
+    if k == 4:
+        return (a * a - 1.0) * ph / sig ** 3
+    raise NotImplementedError(f"univariate ReLU Wick coefficient k={k} not implemented (k<=4)")
+
+
+def _pair_cond_derivs(mU, sU2, mV, sV2, q):
+    """Conditional ReLU/Heaviside delta-moments, conditioning on ``V`` (handoff 6).
+
+    Inputs are broadcastable grids for the ordered pair ``(U=Z_i, V=Z_j)``. Returns
+    six arrays for ``E[ f(U) delta^{(j)}(V) ]`` via ``D_j`` of ``f_V(v) E[f(U)|V=v]``:
+
+        rho * {delta, delta', delta''}  and  H * {delta, delta', delta''}.
+    """
+    sV2 = np.clip(sV2, _VAR_FLOOR, None)
+    beta = q / sV2
+    # Conditional variance tau^2 = sU2 (1 - rho^2). Clip |rho| away from 1 so a
+    # near-degenerate pair (|rho| -> 1) cannot blow up the 1/tau, 1/tau^2 terms; such
+    # pairs do not arise for well-conditioned network covariances, and the diagonal
+    # (rho == 1) is overwritten by the scalar formula regardless.
+    rho2 = np.clip(q * q / (sU2 * sV2), 0.0, 1.0 - 1e-6)
+    tau2 = np.clip(sU2 * (1.0 - rho2), _VAR_FLOOR, None)
+    tau = np.sqrt(tau2)
+    m0 = mU - beta * mV
+    eta = m0 / tau
+    ph_eta, Ph_eta = _phi(eta), _Phi(eta)
+    sigV = np.sqrt(sV2)
+    f0 = _phi(mV / sigV) / sigV                 # marginal pdf of V at 0 (phi is even)
+    f1 = (mV / sV2) * f0                         # f_V'(0)
+    f2 = ((mV * mV) / (sV2 * sV2) - 1.0 / sV2) * f0   # f_V''(0)
+    R0 = tau * ph_eta + m0 * Ph_eta             # E[U_+ | V=0]
+    R1 = beta * Ph_eta                          # d/dt at 0
+    R2 = beta * beta * ph_eta / tau
+    H0 = Ph_eta                                 # P(U>0 | V=0)
+    H1 = beta * ph_eta / tau
+    H2 = -beta * beta * eta * ph_eta / (tau * tau)
+    rho_delta = f0 * R0                          # E[rho(U) delta(V)]   = D0
+    rho_delta_p = -(f1 * R0 + f0 * R1)          # E[rho(U) delta'(V)]  = -D1
+    rho_delta_pp = f2 * R0 + 2.0 * f1 * R1 + f0 * R2   # E[rho(U) delta''(V)] = D2
+    H_delta = f0 * H0
+    H_delta_p = -(f1 * H0 + f0 * H1)
+    H_delta_pp = f2 * H0 + 2.0 * f1 * H1 + f0 * H2
+    return rho_delta, rho_delta_p, rho_delta_pp, H_delta, H_delta_p, H_delta_pp
+
+
+def bivariate_relu_wick(mu: np.ndarray, Sigma: np.ndarray) -> Dict[Tuple[int, int], np.ndarray]:
+    """All bivariate ReLU Wick coefficients ``B[a,b][i,j] = E_G[rho^(a)(Z_i) rho^(b)(Z_j)]``
+    needed for ``R<=4`` (a+b in {3,4}), as a dict of ``(n,n)`` arrays.
+
+    Uses ``rho^0=x_+, rho^1=H, rho^2=delta, rho^3=delta', rho^4=delta''`` so every term
+    reduces to a conditional Gaussian pdf/cdf expression. Diagonal entries (``i==j``)
+    are invalid (singular pair) and MUST be replaced by the scalar diagonal formula by
+    the caller. Validated by finite differences of ``E[rho(Z_i)rho(Z_j)]`` (handoff Test 5).
+    """
+    mu = np.asarray(mu, np.float64)
+    Sigma = np.asarray(Sigma, np.float64)
+    s2 = np.clip(np.diag(Sigma).copy(), 0.0, None)
+    mU, sU2 = mu[:, None], s2[:, None]
+    mV, sV2 = mu[None, :], s2[None, :]
+    q = Sigma
+    rd, rdp, rdpp, Hd, Hdp, Hdpp = _pair_cond_derivs(mU, sU2, mV, sV2, q)   # condition on V=Z_j
+    B = {
+        (0, 3): rdp,  (3, 0): rdp.T,        # rho_i * delta'_j      /  delta'_i * rho_j
+        (0, 4): rdpp, (4, 0): rdpp.T,       # rho_i * delta''_j     /  delta''_i * rho_j
+        (1, 2): Hd,   (2, 1): Hd.T,         # H_i   * delta_j       /  delta_i  * H_j
+        (1, 3): Hdp,  (3, 1): Hdp.T,        # H_i   * delta'_j      /  delta'_i * H_j
+    }
+    # B[2,2] = E[delta(Z_i) delta(Z_j)] = bivariate Gaussian density at (0,0).
+    det = np.clip(sU2 * sV2 - q * q, 1e-300, None)
+    quad = (sV2 * mU * mU - 2.0 * q * mU * mV + sU2 * mV * mV) / det
+    B[(2, 2)] = np.exp(-0.5 * quad) / (2.0 * np.pi * np.sqrt(det))
+    return B
+
+
+def _tiny_psd_cleanup(S: np.ndarray, rtol: float = 1e-9) -> np.ndarray:
+    """Project a covariance back to PSD by clipping negative eigenvalues to 0 (handoff 8).
+
+    Only does the (cheap) eigen-clip when a negative eigenvalue is actually present, and
+    emits a warning when a *large* negative appears: that signals real Edgeworth
+    divergence (e.g. the death/sub regime), which should surface rather than be hidden.
+    """
+    S = 0.5 * (S + S.T)
+    vals, vecs = np.linalg.eigh(S)
+    if vals.size == 0 or vals.min() >= 0.0:
+        return S
+    vmax = max(float(vals.max()), 1.0)
+    if vals.min() < -rtol * vmax:
+        import warnings
+        warnings.warn(f"spikekprop: non-roundoff negative eigenvalue {vals.min():.2e} "
+                      f"(rel {vals.min()/vmax:.2e}) -- possible Edgeworth divergence.",
+                      RuntimeWarning, stacklevel=2)
+    S = (vecs * np.clip(vals, 0.0, None)) @ vecs.T
+    return 0.5 * (S + S.T)
+
+
+def _raw_moments_to_cumulants_34(m: Dict[int, float], R: int) -> Dict[int, float]:
+    """Cumulants kappa_3, kappa_4 from RAW moments m[1..R] (handoff 9)."""
+    out: Dict[int, float] = {}
+    if R >= 3:
+        out[3] = m[3] - 3.0 * m[2] * m[1] + 2.0 * m[1] ** 3
+    if R >= 4:
+        out[4] = (m[4] - 4.0 * m[3] * m[1] - 3.0 * m[2] ** 2
+                  + 12.0 * m[2] * m[1] ** 2 - 6.0 * m[1] ** 4)
+    return out
+
+
+def _one_sided_gauss_moments(m: float, var: float, qmax: int) -> List[float]:
+    """One-sided Gaussian moments ``M_q = E[ S^q 1{S>0} ] = E[ReLU(S)^q]`` for ``S~N(m,var)``.
+
+    ``M_0 = Phi(alpha)`` (= E[1{S>0}]), ``M_1 = m Phi + sig phi``, then the standard recursion
+    ``M_q = m M_{q-1} + (q-1) var M_{q-2}`` (the boundary term vanishes for q>=2). Exact and
+    kink-safe -- this is how the localized special mode passes ReLU without any quadrature.
+    """
+    sig = math.sqrt(max(var, _VAR_FLOOR))
+    al = m / sig
+    Phi, phi = float(_Phi(al)), float(_phi(al))
+    M = [0.0] * (qmax + 1)
+    M[0] = Phi
+    if qmax >= 1:
+        M[1] = m * Phi + sig * phi
+    for q in range(2, qmax + 1):
+        M[q] = m * M[q - 1] + (q - 1) * var * M[q - 2]
+    return M
+
+
+def _relu_power_wick_scalar(M: List[float], m: float, var: float, k: int, p: int) -> float:
+    """Scalar ``E[ d^k ReLU(Z)^p ]`` for ``Z~N(m,var)`` (same identity as kprop.wick).
+
+    ``rho^p`` is C^{p-1}: for ``k<=p`` the derivative is smooth, ``= p!/(p-k)! E[ReLU^{p-k}]``
+    (with ``E[ReLU^0]=Phi``); for ``k>p`` it is ``p!`` times a distributional ReLU derivative,
+    ``= p! E[ d^{k-p+1} ReLU(Z) ]`` (the univariate Wick coefficient).
+    """
+    if k <= p:
+        return math.perm(p, k) * M[p - k]
+    return math.factorial(p) * float(_relu_wick_uni(np.array([m]), np.array([var]), k - p + 1)[0])
+
+
+def _spike_cumulants_scalar_closure(mu, Sigma, u, c, vS, d1, d, R) -> Dict[int, float]:
+    """Update the higher special-mode cumulants ``d_new[p] = kappa_p(u . rho(X))`` (handoff 9B).
+
+    TEMPORARY: scalar-closure cumulant update (not the full diagrammatic 9A); mean and
+    covariance ARE analytic Edgeworth/Wick. Two regimes, both Gauss-Hermite-FREE:
+
+      * LOCALIZED (u ~ a coordinate axis, e.g. ``e1``): the special mode itself is a ReLU
+        input, so ``u . rho(X) = ReLU(S)`` and its cumulants are the EXACT rectified-Gaussian
+        power moments plus the Edgeworth d3/d4 corrections -- closed form, KINK-SAFE (this is
+        the case the old Gauss-Hermite step integrated through the kink with quadrature error).
+      * FLAT / smooth (e.g. ``ones``): the special mode is an average of many ReLUs, so the
+        conditional-mean curve ``r(s) = u . E[rho(X)|S=s]`` is smooth; a 4th-order delta method
+        around ``s=d1`` (analytic derivatives via the univariate Wick coefficients) gives its
+        cumulants. Directional cumulants are O(n^{2-p}) here, so this term is negligible anyway.
+    """
+    if vS <= _TINY:
+        return {}
+    d3_in, d4_in = d.get(3, 0.0), d.get(4, 0.0)
+    i_star = int(np.argmax(np.abs(u)))
+
+    if abs(u[i_star]) > 0.9:                  # LOCALIZED: u . rho(X) = ReLU(special mode)
+        M = _one_sided_gauss_moments(d1, vS, R)
+        coef = {0: 1.0, 3: d3_in / 6.0, 4: d4_in / 24.0}
+        m_raw = {q: sum(cj * _relu_power_wick_scalar(M, d1, vS, j, q) for j, cj in coef.items())
+                 for q in range(1, R + 1)}
+        return _raw_moments_to_cumulants_34(m_raw, R)
+
+    # FLAT / smooth: cumulants of the smooth conditional-mean curve r(S) via a delta method.
+    s2 = np.clip(np.diag(Sigma).copy(), 0.0, None)
+    tau2 = np.maximum(s2 - vS * c * c, 1e-6 * np.maximum(s2, _VAR_FLOOR))   # relative floor: stay smooth
+    rp = [float(np.sum(u * (c ** p) * _relu_wick_uni(mu, tau2, p))) for p in range(R + 1)]
+    a = np.zeros(R + 1)                        # Y = r(S) - r(d1) ~ sum_p a_p X^p,  X = S - d1
+    for p in range(1, R + 1):
+        a[p] = rp[p] / math.factorial(p)
+    kappa = {2: vS}
+    if R >= 3:
+        kappa[3] = d3_in
+    if R >= 4:
+        kappa[4] = d4_in
+    qmax = R * R
+    muX = [0.0] * (qmax + 1)                   # raw moments of X from its cumulants
+    muX[0] = 1.0
+    for nn in range(1, qmax + 1):
+        muX[nn] = sum(math.comb(nn - 1, k - 1) * kappa.get(k, 0.0) * muX[nn - k]
+                      for k in range(1, nn + 1))
+    EY = {1: float(np.dot(a, muX[:len(a)]))}   # raw moments of Y about r(d1)
+    poly = a.copy()
+    for q in range(2, R + 1):
+        poly = np.convolve(poly, a)
+        EY[q] = float(np.dot(poly, muX[:len(poly)]))
+    return _raw_moments_to_cumulants_34(EY, R)
+
+
+def relu_step_edgeworth(st: State, R: int) -> State:
+    """Active ReLU step: analytic Edgeworth/Wick summation, NO Gauss-Hermite (handoff 10).
+
+    Mean and covariance are computed to the tracked order in closed form; the higher
+    special-mode cumulants use the scalar closure above. R=2 reproduces the one-shot
+    exact bivariate Gaussian ReLU (``exact_relu_covariance``) on the full covariance.
+    """
+    if R < 2:
+        raise ValueError("R must be >= 2")
+    if R > 4:
+        raise NotImplementedError("Analytic spike Edgeworth ReLU supports R<=4 for now")
+    n, u, mu = st.n, st.u, st.mu
+    Sigma = (st.vS * np.outer(u, u) + np.outer(u, st.g) + np.outer(st.g, u) + st.Sig_perp)
+    Sigma = 0.5 * (Sigma + Sigma.T)
+    c = (u + st.g / st.vS) if st.vS > _TINY else u.copy()    # loading: Sigma u / vS
+    s2 = np.clip(np.diag(Sigma).copy(), 0.0, None)
+    d3, d4 = st.d.get(3, 0.0), st.d.get(4, 0.0)
+
+    # ---- mean: univariate ReLU Wick coefficients ----
+    mu_new = _relu_wick_uni(mu, s2, 0)
+    if R >= 3:
+        mu_new = mu_new + (d3 / 6.0) * c ** 3 * _relu_wick_uni(mu, s2, 3)
+    if R >= 4:
+        mu_new = mu_new + (d4 / 24.0) * c ** 4 * _relu_wick_uni(mu, s2, 4)
+
+    # ---- raw second moment: exact Gaussian base + bivariate Edgeworth corrections ----
+    base_mu, base_cov = exact_relu_covariance(mu, Sigma)
+    raw = base_cov + np.outer(base_mu, base_mu)
+    if R >= 3:
+        B = bivariate_relu_wick(mu, Sigma)
+        ci, cj = c[:, None], c[None, :]
+        corr3 = (cj ** 3 * B[(0, 3)] + 3.0 * ci * cj ** 2 * B[(1, 2)]
+                 + 3.0 * ci ** 2 * cj * B[(2, 1)] + ci ** 3 * B[(3, 0)])
+        np.fill_diagonal(corr3, 0.0)                          # diagonal set by scalar formula
+        raw = raw + (d3 / 6.0) * corr3
+        if R >= 4:
+            corr4 = (cj ** 4 * B[(0, 4)] + 4.0 * ci * cj ** 3 * B[(1, 3)]
+                     + 6.0 * ci ** 2 * cj ** 2 * B[(2, 2)] + 4.0 * ci ** 3 * cj * B[(3, 1)]
+                     + ci ** 4 * B[(4, 0)])
+            np.fill_diagonal(corr4, 0.0)
+            raw = raw + (d4 / 24.0) * corr4
+
+    # ---- diagonal raw second moment: scalar E[rho(Z)^2] + d3/d4 corrections (handoff 7) ----
+    sig = np.sqrt(np.clip(s2, _VAR_FLOOR, None))
+    a = mu / sig
+    ph, Ph = _phi(a), _Phi(a)
+    diag = (mu * mu + s2) * Ph + mu * sig * ph                # C0 = E[rho(Z)^2]
+    if R >= 3:
+        diag = diag + (d3 / 6.0) * c ** 3 * (2.0 * ph / sig)              # C3 = 2 phi/sig
+    if R >= 4:
+        diag = diag + (d4 / 24.0) * c ** 4 * (-2.0 * a / s2 * ph)         # C4 = -2 a/sig^2 phi
+    np.fill_diagonal(raw, diag)
+    raw = 0.5 * (raw + raw.T)
+
+    Sigma_new = raw - np.outer(mu_new, mu_new)
+    Sigma_new = 0.5 * (Sigma_new + Sigma_new.T)
+    if R >= 3:                                                # signed corrections -> roundoff PSD only
+        Sigma_new = _tiny_psd_cleanup(Sigma_new)
+
+    # ---- re-split into spike state (handoff 8) ----
+    vS_new = float(u @ Sigma_new @ u)
+    Sig_u = Sigma_new @ u
+    g_new = Sig_u - vS_new * u
+    g_new = g_new - float(u @ g_new) * u
+    Sig_perp_new = (Sigma_new - vS_new * np.outer(u, u)
+                    - np.outer(u, g_new) - np.outer(g_new, u))
+    Sig_perp_new = 0.5 * (Sig_perp_new + Sig_perp_new.T)
+    vS_new = max(vS_new, 0.0)
+
+    d_new = (_spike_cumulants_scalar_closure(mu, Sigma, u, c, st.vS, st.d1, st.d, R)
+             if R >= 3 else {})
+    return State(n, u, mu=mu_new, vS=vS_new, g=g_new, Sig_perp=Sig_perp_new, d=d_new)
+
+
 # --------------------------------------------------------------------------- #
 # full forward
 # --------------------------------------------------------------------------- #
 def spike_kprop_predict(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
                         input_dim: int, spike_dir="e1", *, R: int = 2, n_nodes: int = 9,
-                        input_std: float = 1.0,
+                        input_std: float = 1.0, relu_method: str = "edgeworth",
                         mm: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
                         collect: bool = False) -> dict:
     """Predict ``E[f(X)]`` for ``X ~ N(0, input_std^2 I)`` by SPIKE-KPROP along ``spike_dir``.
@@ -334,14 +647,20 @@ def spike_kprop_predict(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
     ``weights`` are ``(W, b)`` float64 numpy pairs in forward order: the hidden matrices (ReLU
     after each, square n x n) then the linear readout (no ReLU). ``spike_dir`` is ``"e1"``,
     ``"ones"``, or a length-``input_dim`` vector. The spike (theta v v^T) is assumed already
-    present in ``weights``; only the DIRECTION is needed here. Returns
-    ``{"mean": (out_dim,), "metadata": {...}, [diagnostics]}``.
+    present in ``weights``; only the DIRECTION is needed here.
+
+    ``relu_method`` selects the ReLU step: ``"edgeworth"`` (default) is the analytic,
+    Gauss-Hermite-FREE Edgeworth/Wick summation (``relu_step_edgeworth``); ``"gh"`` is the
+    legacy Gauss-Hermite quadrature (``relu_step``, kept only for regression). ``n_nodes`` is
+    ignored unless ``relu_method == "gh"``. Returns ``{"mean": (out_dim,), "metadata", ...}``.
     """
     if mm is None:
         mm = lambda A, B: A @ B
     R = int(R)
     if R < 2:
         raise ValueError("SPIKE-KPROP tracks at least the covariance (R>=2)")
+    if relu_method not in ("edgeworth", "gh"):
+        raise ValueError(f"relu_method must be 'edgeworth' or 'gh', got {relu_method!r}")
     n_hidden = len(weights) - 1
     if n_hidden < 1:
         raise ValueError("need at least one hidden layer + a readout")
@@ -353,7 +672,8 @@ def spike_kprop_predict(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
         W, b = weights[li]
         st = linear_step(st, np.asarray(W, np.float64),
                          None if b is None else np.asarray(b, np.float64), mm, v_out=v)
-        st = relu_step(st, R=R, n_nodes=n_nodes)
+        st = (relu_step_edgeworth(st, R=R) if relu_method == "edgeworth"
+              else relu_step(st, R=R, n_nodes=n_nodes))
         if collect:
             special_by_layer.append(dict(layer=li, d1=st.d1, vS=st.vS,
                                          d={p: st.d.get(p, 0.0) for p in range(3, R + 1)}))
@@ -362,7 +682,7 @@ def spike_kprop_predict(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
     mean = np.asarray(W_ro, np.float64) @ st.mu + (0.0 if b_ro is None else np.asarray(b_ro, np.float64))
 
     out = {"mean": np.asarray(mean, np.float64).reshape(-1),
-           "metadata": {"R": R, "n_nodes": n_nodes, "n_hidden": n_hidden,
+           "metadata": {"R": R, "n_nodes": n_nodes, "n_hidden": n_hidden, "relu_method": relu_method,
                         "input_dim": input_dim, "output_dim": int(mean.reshape(-1).shape[0]),
                         "spike_dir": spike_dir if isinstance(spike_dir, str) else "custom"}}
     if collect:

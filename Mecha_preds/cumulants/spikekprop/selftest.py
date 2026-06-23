@@ -5,16 +5,20 @@ reference (no torch needed). Run:
 
     python -m Mecha_preds.cumulants.spikekprop.selftest
 
+The ACTIVE ReLU step is the analytic Gauss-Hermite-free Edgeworth/Wick summation
+(``relu_step_edgeworth``); ``spike_kprop_predict`` uses it by default. The legacy GH path
+(``relu_step``) is retained only for the regression checks below (2a/2b/4). The dedicated
+analytic-path suite (handoff Tests 1-6 + e2e) lives in ``test_edgeworth``-style scripts.
+
 Checks:
   1. linear step == direct  M mu, M Sigma M^T      (machine precision)  -- for v=e1 AND v=ones
-  2a. v=ones conditioning+mix R=2 == one-shot bivariate ReLU (machine precision: the flat
-      special direction is never a ReLU input, so the quadrature is exact -- same as SW-KPROP)
-  2b. v=e1  conditioning+mix R=2: the special mode IS a ReLU input, so its kink gives a GH
-      QUADRATURE error -- not a bug; verify it CONVERGES (shrinks) as n_nodes grows
-  3. depth-1 R=2 mean is EXACT vs MC                (agrees to sampling noise) -- both directions
-  4. v="ones" reproduces SW-KPROP bit-for-bit       (relerr < 1e-12)
-  5. depth-3 R-sweep on the localized (e1) vs flat (ones) O(1)-spike models: R>=3 helps on the
-     LOCALIZED spike (tracks C(v,v,v),C(v,v,v,v)) and is ~inert on the FLAT spike (informational)
+  2a. [legacy GH] v=ones conditioning+mix R=2 == one-shot bivariate ReLU (machine precision)
+  2b. [legacy GH] v=e1 R=2: the special mode IS a ReLU input, so its kink gives a GH QUADRATURE
+      error; verify it CONVERGES with n_nodes. (The analytic path removes this error entirely.)
+  3. depth-1 R=2 mean vs MC (agrees to sampling noise) -- both directions, analytic path
+  4. v="ones" reproduces SW-KPROP bit-for-bit on the GH path (relerr < 1e-12)
+  5. depth-3 R-sweep, analytic path: R>=3 helps on the LOCALIZED (e1) spike (tracks
+     C(v,v,v),C(v,v,v,v)) and is ~inert on the FLAT (ones) spike
 """
 from __future__ import annotations
 
@@ -128,16 +132,17 @@ def run(verbose: bool = True) -> bool:
             print(f"[3] depth-1 R=2 mean vs MC ({direction:>4}):           "
                   f"rel {rel_err:.2e}  MC-z {z:.2f}  {'OK' if passed else 'FAIL'}")
 
-    # 4. v="ones" reproduces SW-KPROP bit-for-bit (same algorithm, same direction)
+    # 4. v="ones" reproduces SW-KPROP bit-for-bit -- a property of the LEGACY Gauss-Hermite
+    #    path (SW-KPROP is GH-based), so compare with relu_method="gh".
     Ws = _make_net(64, 3, seed=11, theta=1.0, direction="ones")
     e_sw = 0.0
     for R in (2, 3, 4):
-        a = spike_kprop_predict(Ws, 64, "ones", R=R, n_nodes=15)["mean"]
+        a = spike_kprop_predict(Ws, 64, "ones", R=R, n_nodes=15, relu_method="gh")["mean"]
         b = sw_kprop_predict(Ws, 64, R=R, n_nodes=15)["mean"]
         e_sw = max(e_sw, _rel(a, b))
     ok &= e_sw < 1e-12
     if verbose:
-        print(f"[4] v='ones' == SW-KPROP (R=2,3,4):                relerr {e_sw:.1e}   "
+        print(f"[4] v='ones' == SW-KPROP, GH path (R=2,3,4):       relerr {e_sw:.1e}   "
               f"{'OK' if e_sw < 1e-12 else 'FAIL'}")
 
     # 5. depth-3 R-sweep: R>=3 must HELP on the localized (e1) spike and be ~INERT on the

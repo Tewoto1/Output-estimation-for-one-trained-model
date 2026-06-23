@@ -58,14 +58,16 @@ How well does cumulant propagation predict the output mean $E[f(X)]$, $X\sim\mat
 ReLU MLP whose hidden matrices carry a **small ($O(1)$ eigenvalue) rank-one spike** — and *where the
 direction of that spike decides whether ordinary kprop is enough*?
 
-$$M = W' + \theta\,vv^\top,\qquad W'_{ij}\sim\mathcal N(0,\tfrac1{\text{fan\_in}}),\quad \|v\|_2=1,\quad \theta=1.$$
+$$M = W' + \theta\,vv^\top,\qquad W'_{ij}\sim\mathcal N(0,\tfrac1{\text{fan\_in}}),\quad \|v\|_2=1,\quad \theta=-1.$$
 
-Two models, same eigenvalue $\theta=1$, different direction:
+The spike is in the **minus direction** ($\theta=-1$, eigenvalue $-1$ — $O(1)$ magnitude, so the same
+*resolvable-vs-not* theory applies; the sign only flips the sign of the spike-direction cumulants). Two
+models, same $|\theta|=1$, different direction:
 
 | model | spike | direction $v$ | character |
 |---|---|---|---|
-| **(1) localized** | $W'+\theta\,e_1e_1^\top$ | $e_1$ | one coordinate, $\sum_i v_i^r = 1$ |
-| **(2) flat** | $W'+\theta\,\tfrac1n\mathbf 1\mathbf 1^\top$ | $\tfrac1{\sqrt n}\mathbf 1$ | all-ones, $\sum_i v_i^r = n^{1-r/2}$ |
+| **(1) localized** | $W'-e_1e_1^\top$ | $e_1$ | one coordinate, $\sum_i v_i^r = 1$ |
+| **(2) flat** | $W'-\tfrac1n\mathbf 1\mathbf 1^\top$ | $\tfrac1{\sqrt n}\mathbf 1$ | all-ones, $\sum_i v_i^r = n^{1-r/2}$ |
 
 Spike on **hidden layers only** (kprop is exact on the linear readout); **no training**.
 
@@ -106,6 +108,9 @@ approximation, visible as a residual on $e_1$.
 
 Needs Python ≥ 3.12 *or* the kprop-compat shim (auto-active on import), plus torch & scipy.""")
 
+# install runtime deps not in the base Colab image (kprop's type annotations use jaxtyping)
+code(r"""!pip install -q jaxtyping""")
+
 code(BOOTSTRAP_CELL)
 
 # =============================================================================
@@ -124,7 +129,7 @@ spikekprop_selftest()   # prints [1]..[5] then 'SELFTEST: PASS'
 # =============================================================================
 md(r"""## §1 — Config: knobs, device & recycling (probe here, not in `experiments.py`)
 
-Two models (`e1` localized, `ones` flat), $\theta=1$, hidden-only spike, depth 3, no training.
+Two models (`e1` localized, `ones` flat), $\theta=-1$ (minus direction), hidden-only spike, depth 3, no training.
 Predictors: ordinary **exact-K2** kprop and (small widths) **k=3**, plus **SPIKE-KPROP** $R\in\{2,3,4\}$.
 `N_NODES` is the Gauss–Hermite count for the special mode — **coordinate spikes (`e1`) need more
 nodes** (the special mode is a ReLU input; see §0), so we use a generous value.""")
@@ -145,7 +150,7 @@ torch.set_num_threads(max(torch.get_num_threads(), 2))
 
 # ---- the two O(1)-spike models (NO TRAINING) ----
 DIRECTIONS = ["e1", "ones"]                # localized (e1 e1^T) vs flat ((1/n) 11^T)
-THETA      = 1.0                           # introduced eigenvalue (O(1)); ||theta v v^T||_op = 1
+THETA      = -1.0                          # MINUS direction: M = W' - v v^T (eigenvalue -1, O(1) magnitude)
 DEPTH      = 3
 WIDTHS     = [32, 64, 128] if QUICK else [64, 128, 256, 512]
 SEEDS      = [1, 2]
@@ -155,7 +160,7 @@ ACTIVATION = "relu"
 R_VALUES     = [2, 3, 4]                    # SPIKE-KPROP: 2 = exact rank-2; 3,4 add C(v,v,v), C(v,v,v,v)
 N_NODES      = 31 if QUICK else 61         # Gauss-Hermite nodes (coordinate spike e1 wants >= ~41)
 K3_MAX_WIDTH = 128                          # ordinary k=3 is an n^3 tensor -> only run it up to here
-MC_SAMPLES   = 200_000 if QUICK else 2_000_000
+MC_SAMPLES   = 200_000 if QUICK else 20_000_000   # 20M for the true run (clean enough to resolve n-scaling)
 
 # ---- GPU policy: float32 MC on DEVICE, float64 for the predictors (repo policy) ----
 if DEVICE.type == "cuda":
@@ -304,7 +309,7 @@ style = {"k2": ("o-", "k", "exact-K2 (ordinary)"), "k3": ("s-", "0.5", "k=3 (ord
 fig, axes = plt.subplots(2, 2, figsize=(13.8, 9.6))
 for col, direction in enumerate(DIRECTIONS):
     axL, axR = axes[0, col], axes[1, col]
-    title = "localized  $e_1e_1^\\top$" if direction == "e1" else "flat  $\\frac1n\\mathbf 1\\mathbf 1^\\top$"
+    title = "localized  $-e_1e_1^\\top$" if direction == "e1" else "flat  $-\\frac1n\\mathbf 1\\mathbf 1^\\top$"
     # top: unscaled magnitude ||E[out]||
     axL.loglog(WIDTHS, series(direction, "mc_norm"), "k*-", ms=9, label="MC (truth)")
     for key in ["k2"] + [f"spk_R{R}" for R in R_VALUES]:
@@ -327,40 +332,97 @@ plt.tight_layout(); plt.show()
 """)
 
 # =============================================================================
-md(r"""## §3 — Headline: does the ordinary-kprop error *resolve* (shrink with width)?
+md(r"""## §3 — Headline: **fit and TEST** the $n$-scaling against the theory exponent
 
-The theorem's sharpest claim is a **width-scaling contrast** for ordinary kprop (exact-K2):
+Not just a plot — we **fit** $\text{error}=C\,n^{p}$ (OLS in log–log, slope $\pm$ standard error, $R^2$)
+and check it against the exponent the theory predicts.
 
-- **flat** spike → directional cumulants $O(n^{2-r})$ → error should **shrink** with width ($p<0$),
-- **localized** spike → directional cumulants $O(1)$ → error should stay **flat** ($p\approx0$): the
-  covariance closure cannot resolve the spike no matter how wide.
+**What theory predicts.** Ordinary exact-K2 keeps cumulants to order $K{=}2$; the error-diagram bound
+gives *squared* error $\sim n^{-K}$, i.e. **relative error $\propto n^{-1}$**, but only when the dropped
+spike-direction cumulants actually decay — which depends on the direction via $c_{r,n}(vv^\top)=(\sum_i|v_i|^r)^2$:
 
-We fit $\text{error}\propto n^{p}$ per direction for the ordinary exact-K2 closure, and overlay
-SPIKE-KPROP $R{=}4$ to show how much of the localized gap the spike-direction cumulants close.""")
+- **flat** $v=\tfrac1{\sqrt n}\mathbf 1$: $c_{r,n}=n^{2-r}\to0$ → resolvable → slope $p=-1$ (the $K{=}2$ rate);
+- **localized** $v=e_1$: $c_{r,n}=1$ for all $r$ (does *not* decay) → **not** resolvable at that rate →
+  slope **shallower than $-1$** (toward $0$); SPIKE-KPROP only lowers the prefactor, not the rate.
+
+**The tests** (printed below): (a) is the flat exact-K2 slope **consistent with $-1$** (within $2$ SE),
+and does a *fixed* $n^{-1}$ law fit it ($R^2$)? (b) is the localized slope **significantly shallower**
+than the flat one (so the $O(1)$ spike is genuinely not resolved at the $K{=}2$ rate)? Clean resolution
+needs the MC floor well below the errors — hence the 20M-sample true run; if a curve has flattened onto
+the floor, exclude those widths.""")
 code(r"""
-def fit_slope(direction, key):
-    w = np.array(WIDTHS, float); e = np.array(series(direction, key))
-    ok = np.isfinite(e) & (e > 0)
-    return float(np.polyfit(np.log(w[ok]), np.log(e[ok]), 1)[0]) if ok.sum() >= 2 else float("nan")
+THEORY_P = {"ones": -1.0, "e1": 0.0}        # flat: K=2 rate n^{-1}; localized: O(1), no decay (slope 0)
 
-fig, ax = plt.subplots(figsize=(8.0, 5.6))
-print(f"{'direction':>10} | {'K2 slope p':>11} {'K2 err@maxN':>12} | {'SPIKE-R4 slope':>14} {'R4 err@maxN':>12}")
-print("-" * 70)
+def loglog_fit(direction, key, drop_floor=2.0):
+    "OLS slope of log(err) vs log(n) over ALL (width,seed) points above drop_floor*MC-floor."
+    pts = []
+    for r in rows:
+        if r["direction"] != direction:
+            continue
+        e = r.get(f"{key}_rel", float("nan"))
+        if np.isfinite(e) and e > 0 and e > drop_floor * r.get("floor", 0.0):
+            pts.append((r["w"], e))
+    if len(pts) < 3:
+        return dict(slope=float("nan"), se=float("nan"), r2=float("nan"), n=len(pts))
+    x = np.log([p[0] for p in pts]); y = np.log([p[1] for p in pts]); k = len(x)
+    A = np.vstack([x, np.ones_like(x)]).T
+    coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+    res = y - A @ coef; ss = float((res ** 2).sum())
+    se = float(np.sqrt(ss / max(k - 2, 1) / ((x - x.mean()) ** 2).sum()))
+    r2 = 1.0 - ss / (float(((y - y.mean()) ** 2).sum()) + 1e-30)
+    return dict(slope=float(coef[0]), se=se, r2=r2, n=k)
+
+def fixed_exponent_r2(direction, key, p):
+    "R^2 of forcing slope = p (fit only the constant C): tests whether n^p specifically describes it."
+    pts = [(r["w"], r[f"{key}_rel"]) for r in rows if r["direction"] == direction
+           and np.isfinite(r.get(f"{key}_rel", np.nan)) and r.get(f"{key}_rel", 0) > 2 * r.get("floor", 0)]
+    if len(pts) < 2: return float("nan")
+    x = np.log([q[0] for q in pts]); y = np.log([q[1] for q in pts])
+    logC = float((y - p * x).mean()); yhat = logC + p * x
+    return 1.0 - float(((y - yhat) ** 2).sum()) / (float(((y - y.mean()) ** 2).sum()) + 1e-30)
+
+fits = {d: loglog_fit(d, "k2") for d in DIRECTIONS}
+print("SCALING TEST — ordinary exact-K2, fit error = C n^p  (errors above 2x MC floor only):\n")
+print(f"{'direction':>14} | {'fitted p':>16} | {'R^2':>5} | {'theory p':>8} | {'|p-theory|/SE':>13} | verdict")
+print("-" * 92)
+for d in DIRECTIONS:
+    f = fits[d]; th = THEORY_P[d]; lab = "localized e1" if d == "e1" else "flat (ones)"
+    z = abs(f["slope"] - th) / (f["se"] + 1e-30)
+    verdict = ("consistent" if z <= 2 else "OFF") if np.isfinite(z) else "n/a"
+    print(f"{lab:>14} | {f['slope']:>7.3f} ± {f['se']:<6.3f} | {f['r2']:>5.2f} | {th:>8.1f} | "
+          f"{z:>13.2f} | {verdict}", flush=True)
+
+ff, fl = fits["ones"], fits["e1"]
+print(f"\n(a) flat resolves at the K=2 rate?  fitted p = {ff['slope']:.3f} ± {ff['se']:.3f}; "
+      f"forcing n^-1 gives R^2 = {fixed_exponent_r2('ones','k2',-1.0):.3f}  "
+      f"-> {'consistent with n^-1' if abs(ff['slope']+1) <= 2*ff['se'] else 'NOT n^-1'}")
+d_slope = fl["slope"] - ff["slope"]; d_se = math.sqrt(ff["se"]**2 + fl["se"]**2)
+print(f"(b) localized shallower than flat?  p_loc - p_flat = {d_slope:+.3f} ± {d_se:.3f}  "
+      f"-> {'YES, spike NOT resolved at the K=2 rate' if d_slope > 2*d_se else 'inconclusive (need wider n / more MC)'}")
+
+# plot with the fitted power laws overlaid + an n^-1 guide
+fig, ax = plt.subplots(figsize=(8.2, 5.6))
+wgrid = np.array(WIDTHS, float)
 for direction in DIRECTIONS:
     c = "tab:purple" if direction == "e1" else "tab:blue"
     lab = "localized $e_1$" if direction == "e1" else "flat (ones)"
-    k2 = series(direction, "k2_rel"); r4 = series(direction, "spk_R4_rel")
+    k2 = np.array(series(direction, "k2_rel"), float)
+    r4 = np.array(series(direction, "spk_R4_rel"), float)
     ax.loglog(WIDTHS, k2, "o-",  color=c, label=f"{lab}: exact-K2")
-    ax.loglog(WIDTHS, r4, "D--", color=c, alpha=0.6, label=f"{lab}: SPIKE R=4")
-    p_k2, p_r4 = fit_slope(direction, "k2_rel"), fit_slope(direction, "spk_R4_rel")
-    print(f"{lab:>10} | {p_k2:>11.3f} {k2[-1]:>12.3e} | {p_r4:>14.3f} {r4[-1]:>12.3e}")
-ax.loglog(WIDTHS, [max(series(d, 'floor')[i] for d in DIRECTIONS) for i in range(len(WIDTHS))],
-          "-", color="0.75", lw=1, label="MC floor")
+    ax.loglog(WIDTHS, r4, "D--", color=c, alpha=0.55, label=f"{lab}: SPIKE R=4")
+    p = fits[direction]["slope"]                              # fitted power law, anchored at last point
+    if np.isfinite(p) and np.isfinite(k2[-1]) and k2[-1] > 0:
+        ax.loglog(wgrid, k2[-1] * (wgrid / wgrid[-1]) ** p, ":", color=c, lw=1.3,
+                  label=f"{lab} fit  p={p:.2f}")
+flat_last = np.array(series("ones", "k2_rel"), float)[-1]     # n^-1 guide anchored on the flat curve
+if np.isfinite(flat_last) and flat_last > 0:
+    ax.loglog(wgrid, flat_last * (wgrid / wgrid[-1]) ** (-1.0), "-.", color="0.4", lw=1,
+              label="$n^{-1}$ guide")
+ax.loglog(WIDTHS, [max(series(d, "floor")[i] for d in DIRECTIONS) for i in range(len(WIDTHS))],
+          "-", color="0.8", lw=1, label="MC floor")
 ax.set_xlabel("width  n"); ax.set_ylabel(r"$\|\mu_{\rm pred}-\mu_{\rm MC}\|/\|\mu_{\rm MC}\|$")
-ax.set_title(f"resolvability of the $O(1)$ spike (depth {DEPTH}, $\\theta$={THETA})")
-ax.legend(fontsize=8); ax.grid(alpha=0.3, which="both"); plt.tight_layout(); plt.show()
-print("\nExpected: flat slope p<0 (error resolves) ; localized slope ~0 for exact-K2 (does NOT resolve),")
-print("with SPIKE-KPROP R=4 lowering the localized curve toward the flat one.")
+ax.set_title(f"$n$-scaling of the error (depth {DEPTH}, $\\theta$={THETA}); dotted = fitted power law")
+ax.legend(fontsize=7.5); ax.grid(alpha=0.3, which="both"); plt.tight_layout(); plt.show()
 """)
 
 # =============================================================================
@@ -485,16 +547,19 @@ if IN_COLAB:
 md(r"""## §7 — Summary
 
 - **What ran:** random depth-{DEPTH} ReLU MLPs (square, no bias), hidden matrices spiked by an
-  **$O(1)$ eigenvalue** rank-one term $\theta vv^\top$ ($\theta=1$) in two directions — **localized
-  $e_1$** and **flat $\tfrac1{\sqrt n}\mathbf 1$** — **no training**; predictors **ordinary exact-K2
-  / k=3** vs **SPIKE-KPROP $R\in\{2,3,4\}$** vs Monte-Carlo, swept over width.
+  **$O(1)$ eigenvalue** rank-one term $\theta vv^\top$ ($\theta=-1$, the minus direction) in two
+  directions — **localized $e_1$** and **flat $\tfrac1{\sqrt n}\mathbf 1$** — **no training**;
+  predictors **ordinary exact-K2 / k=3** vs **SPIKE-KPROP $R\in\{2,3,4\}$** vs **20M-sample**
+  Monte-Carlo, swept over width.
 - **SPIKE-KPROP** (`Mecha_preds/cumulants/spikekprop`) is SW-KPROP generalized to an arbitrary unit
   spike direction $v$: it retains the spike-direction cumulants $d_p=C(v,\dots,v)=\kappa_p(S)$ of the
   special mode $S=v\!\cdot\!X$ to order $R$ ($R{=}2$ exact rank-2; $R{=}3$ adds $d_3$; $R{=}4$ adds
   $d_4=C(v,v,v,v)$ — the degree-4 trace-boundary term). $v=$`ones` reproduces SW-KPROP exactly.
-- **Headline (§3):** the trace-projection theorem predicts the **flat** spike is *resolvable*
-  (ordinary-kprop error shrinks with width, $c_{r,n}=O(n^{2-r})$) while the **localized** spike is
-  *not* (error $O(1)$, flat in width) — read the fitted slopes.
+- **Headline (§3) — fitted & tested:** we fit $\text{error}=C\,n^{p}$ (slope $\pm$ SE, $R^2$) and test
+  it against theory: the **flat** spike is *resolvable* at the $K{=}2$ rate $p=-1$ ($c_{r,n}=O(n^{2-r})$),
+  while the **localized** spike is *not* ($c_{r,n}=O(1)$, slope shallower than $-1$ toward $0$). The cell
+  prints whether the flat slope is consistent with $-1$ and whether the localized slope is significantly
+  shallower — needs the 20M-sample MC floor well below the errors to resolve cleanly.
 - **Spike-direction cumulants (§4–§5):** $R{\ge}3$ **helps on $e_1$** and is **inert on flat**;
   §5 shows $d_3,d_4$ are appreciable only for $e_1$. The $e_1$ **residual** after $R{=}4$ is the mixed
   trace coupling $C(v,v,i,j)\sim\theta\delta_{ij}$ the conditional-Gaussian closure does not propagate

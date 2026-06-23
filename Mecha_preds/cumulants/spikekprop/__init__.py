@@ -17,7 +17,10 @@ survive for a LOCALIZED spike (``v = e1``: ``sum_i |v_i|^r = 1``) and vanish for
 SW-KPROP. ReLU numerics reuse ``..swkprop.relu`` (validated). Needs Python >= 3.12 or the
 kprop-compat shim only transitively (the spikekprop core itself is torch-free numpy/scipy).
 """
-from .core import spike_kprop_predict, unit_vector
+from .core import (
+    spike_kprop_predict, unit_vector,
+    relu_step_edgeworth, bivariate_relu_wick,   # analytic Gauss-Hermite-free ReLU step
+)
 from .adapter import (
     run_spike_kprop,
     default_spike_kprop_config,
@@ -27,5 +30,6 @@ from .adapter import (
 
 __all__ = [
     "run_spike_kprop", "spike_kprop_predict", "unit_vector",
+    "relu_step_edgeworth", "bivariate_relu_wick",
     "default_spike_kprop_config", "config_summary", "extract_mean",
 ]

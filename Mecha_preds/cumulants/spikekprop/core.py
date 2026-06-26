@@ -444,22 +444,30 @@ def bivariate_relu_wick(mu: np.ndarray, Sigma: np.ndarray) -> Dict[Tuple[int, in
     return B
 
 
-def _tiny_psd_cleanup(S: np.ndarray, rtol: float = 1e-9) -> np.ndarray:
+_PSD_WARN_REL = 5e-2   # warn only when a negative eigenvalue exceeds this fraction of the spectral top
+
+def _tiny_psd_cleanup(S: np.ndarray, warn_rel: float = _PSD_WARN_REL) -> np.ndarray:
     """Project a covariance back to PSD by clipping negative eigenvalues to 0 (handoff 8).
 
-    Only does the (cheap) eigen-clip when a negative eigenvalue is actually present, and
-    emits a warning when a *large* negative appears: that signals real Edgeworth
-    divergence (e.g. the death/sub regime), which should surface rather than be hidden.
+    A truncated Edgeworth/Wick covariance correction (R>=3) is a *signed* term, so it can
+    leave the PSD cone by a small amount; clipping that back is expected and harmless (the
+    clipped mass is far below the scheme's truncation error). We warn ONLY when the
+    indefiniteness is *large* (a negative eigenvalue exceeding ``warn_rel`` of the spectral
+    top, default 5%), which signals genuine Edgeworth divergence (e.g. the death/sub regime,
+    where negatives are O(1)+), not a benign sub-percent clip.
     """
     S = 0.5 * (S + S.T)
     vals, vecs = np.linalg.eigh(S)
-    if vals.size == 0 or vals.min() >= 0.0:
+    vmin = float(vals.min()) if vals.size else 0.0
+    if vmin >= 0.0:
         return S
-    vmax = max(float(vals.max()), 1.0)
-    if vals.min() < -rtol * vmax:
+    scale = max(float(vals.max()), _TINY)
+    if vmin < -warn_rel * scale:           # large -> real concern, surface it
         import warnings
-        warnings.warn(f"spikekprop: non-roundoff negative eigenvalue {vals.min():.2e} "
-                      f"(rel {vals.min()/vmax:.2e}) -- possible Edgeworth divergence.",
+        neg = float(-vals[vals < 0.0].sum()); pos = float(vals[vals > 0.0].sum())
+        warnings.warn(f"spikekprop: covariance indefinite, min eig {vmin:.2e} (rel {vmin/scale:.1e}, "
+                      f"clipped neg-mass {neg/(pos + _TINY):.1e} of trace) -- Edgeworth correction "
+                      f"may be diverging; consider lower R or check the spike magnitude.",
                       RuntimeWarning, stacklevel=2)
     S = (vecs * np.clip(vals, 0.0, None)) @ vecs.T
     return 0.5 * (S + S.T)

@@ -25,6 +25,9 @@ Mecha_preds/      mechanistic predictors
     kprop/            the vendored kprop algorithm (from the ARC paper repo)
     swkprop/          shifted-weight kprop: all-ones special direction, √n weight shift
     spikekprop/       spike kprop: ANY unit spike direction v, O(1)-eigenvalue spike M=W'+θvvᵀ
+  binned_kprop/     coordinate-spike binned kprop (K=2): HMM over the spiked coord e₁ +
+                    conditional bulk kprop per bin (M=W+e₁e₁ᵀ); num_bins hyperparam.
+                    Verified width law MSE~n⁻². See Mecha_preds/binned_kprop/README.md
 colab_notebooks/  generated notebooks + their build_*.py generators (+ shared _nb.py)
 utils.py          device / seeding / numpy helpers
 ```

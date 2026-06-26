@@ -69,7 +69,7 @@ ReLU step
     d3..dR by the Edgeworth/Gram-Charlier series for R>=3), run the EXACT rank-2 Gaussian-ReLU
     step on the O(1) conditional law at each Gauss-Hermite node, and mix.
 
-The core is numpy-only (scipy for the ReLU integrals, reused from ``swkprop.relu``).
+The core is numpy-only (scipy for the ReLU integrals, from the canonical ``..relu_integrals``).
 ``run_spike_kprop`` in ``adapter.py`` wraps a torch ``model.MLP``.
 """
 from __future__ import annotations
@@ -80,52 +80,18 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 from numpy.polynomial.hermite import hermgauss
 
-# Reuse SW-KPROP's validated, direction-independent Gaussian-ReLU kernel (numpy/scipy).
+# The canonical, direction-independent Gaussian-ReLU kernel (numpy/scipy, torch-free).
 # ``_phi``/``_Phi`` are the scipy-backed standard-normal pdf/cdf used everywhere here, so
 # the analytic Wick coefficients below match ``kprop.wick.relu_wick_coef`` numerically.
-from ..swkprop.relu import relu_moments_1d, exact_relu_covariance, _phi, _Phi
+from ..relu_integrals import relu_moments_1d, exact_relu_covariance, _phi, _Phi
 
 _TINY = 1e-30
 _VAR_FLOOR = 1e-12
 
 
-# --------------------------------------------------------------------------- #
-# probabilists' Hermite He_p (for the Gram-Charlier special-mode reweight)
-# (standard; mirrors swkprop.core._He so this module stays self-contained)
-# --------------------------------------------------------------------------- #
-def _He(p: int, z: np.ndarray) -> np.ndarray:
-    if p == 0:
-        return np.ones_like(z)
-    if p == 1:
-        return z
-    if p == 2:
-        return z * z - 1.0
-    if p == 3:
-        return z ** 3 - 3.0 * z
-    if p == 4:
-        return z ** 4 - 6.0 * z ** 2 + 3.0
-    if p == 5:
-        return z ** 5 - 10.0 * z ** 3 + 15.0 * z
-    if p == 6:
-        return z ** 6 - 15.0 * z ** 4 + 45.0 * z ** 2 - 15.0
-    raise NotImplementedError(f"He_{p} not implemented (R<=6 supported)")
-
-
-def _central_moments_to_cumulants(mu_c: Dict[int, float], max_p: int) -> Dict[int, float]:
-    """Central moments {2:mu2, 3:mu3, ...} -> cumulants {p: kappa_p} for p=2..max_p."""
-    k: Dict[int, float] = {}
-    m2 = mu_c.get(2, 0.0)
-    k[2] = m2
-    if max_p >= 3:
-        k[3] = mu_c.get(3, 0.0)
-    if max_p >= 4:
-        k[4] = mu_c.get(4, 0.0) - 3.0 * m2 * m2
-    if max_p >= 5:
-        k[5] = mu_c.get(5, 0.0) - 10.0 * mu_c.get(3, 0.0) * m2
-    if max_p >= 6:
-        k[6] = (mu_c.get(6, 0.0) - 15.0 * mu_c.get(4, 0.0) * m2
-                - 10.0 * mu_c.get(3, 0.0) ** 2 + 30.0 * m2 ** 3)
-    return k
+# Hermite He_p and the central-moment -> cumulant conversion are shared (one copy) in
+# ``.._cumulant_math`` -- imported here under the original private names used below.
+from .._cumulant_math import He as _He, central_moments_to_cumulants as _central_moments_to_cumulants
 
 
 def unit_vector(spec, n: int) -> np.ndarray:

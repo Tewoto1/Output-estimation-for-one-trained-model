@@ -36,8 +36,8 @@ State (per bin ``alpha``, K=2)::
 with bulk dimension ``d = n - 1``.  Coordinate 0 is NEVER stored inside the bulk
 mean/covariance arrays -- it lives only in ``p`` and ``a``.
 
-The ReLU integrals reuse the repo's validated numpy/scipy kernel
-(``..cumulants.swkprop.relu``); see ``_relu.py`` for the import shim.
+The ReLU integrals reuse the repo's canonical numpy/scipy kernel
+(``..cumulants.relu_integrals``); see ``_relu.py`` for the import shim.
 """
 from __future__ import annotations
 
@@ -197,6 +197,83 @@ def make_relu_post_edges(num_bins: int, *, std: float = 1.0,
     edges[1:-1] = std * ndtri(0.5 + 0.5 * qs[1:-1])
     edges[-1] = np.inf if tail_inf else std * ndtri(0.5 + 0.5 * (1.0 - 0.5 / num_bins))
     return edges
+
+
+# --------------------------------------------------------------------------- #
+# WASSERSTEIN-OPTIMAL bin placement (Lloyd-Max scalar quantizer)
+# --------------------------------------------------------------------------- #
+# The binning collapses the spike coordinate A within each cell to one representative,
+# so the squared error it introduces is exactly  sum_a p_a Var(A | cell_a) = W_2^2( law(A),
+# binned ).  Minimizing that W_2 distance over (edges, reps) is optimal scalar quantization,
+# whose stationarity conditions are: reps = cell CENTROIDS (conditional means) and interior
+# edges = MIDPOINTS between adjacent reps -- the Lloyd-Max algorithm. This beats equal-mass
+# quantiles (``make_gaussian_edges``), which over-resolve the dense centre; the W_2 optimum
+# puts more points in the tails (point density ~ f^{1/3} vs ~ f). See ALGORITHM.md sec 7.
+def _truncnorm_cell(a: float, b: float) -> Tuple[float, float, float]:
+    """``(mass, centroid, within-cell variance)`` of ``N(0,1)`` truncated to ``[a, b)``."""
+    Z = float(_Phi(np.array(b)) - _Phi(np.array(a)))
+    if Z <= _TINY:
+        mid = 0.0 if (math.isinf(a) or math.isinf(b)) else 0.5 * (a + b)
+        return 0.0, mid, 0.0
+    pa = 0.0 if math.isinf(a) else float(_phi(np.array(a)))
+    pb = 0.0 if math.isinf(b) else float(_phi(np.array(b)))
+    ap = 0.0 if math.isinf(a) else a * pa
+    bp = 0.0 if math.isinf(b) else b * pb
+    v = (pa - pb) / Z
+    var = max(1.0 + (ap - bp) / Z - v * v, 0.0)
+    return Z, v, var
+
+
+def _lloyd_max_interval(lo: float, hi: float, num_pts: int, *, iters: int = 200,
+                        tol: float = 1e-12) -> Tuple[np.ndarray, np.ndarray]:
+    """Lloyd-Max W2 quantizer of ``N(0,1)`` restricted to ``[lo, hi)`` with ``num_pts`` points.
+    Returns ``(edges[num_pts+1], reps[num_pts])`` (edges[0]=lo, edges[-1]=hi)."""
+    from scipy.special import ndtri
+    if num_pts <= 1:
+        return np.array([lo, hi], float), np.array([_truncnorm_cell(lo, hi)[1]])
+    Plo, Phi_hi = float(_Phi(np.array(lo))), float(_Phi(np.array(hi)))
+    qs = np.clip(np.linspace(Plo, Phi_hi, num_pts + 1), 1e-15, 1 - 1e-15)
+    e = ndtri(qs); e[0], e[-1] = lo, hi                       # init equal-mass within [lo,hi)
+    for _ in range(iters):
+        v = np.array([_truncnorm_cell(e[i], e[i + 1])[1] for i in range(num_pts)])
+        ne = e.copy(); ne[1:-1] = 0.5 * (v[:-1] + v[1:])       # edges <- midpoints of centroids
+        if np.max(np.abs(ne[1:-1] - e[1:-1])) < tol:
+            e = ne
+            break
+        e = ne
+    v = np.array([_truncnorm_cell(e[i], e[i + 1])[1] for i in range(num_pts)])
+    return e, v
+
+
+def lloyd_max_edges(mean: float, std: float, num_bins: int, *, rectified: bool = False,
+                    iters: int = 200) -> Tuple[np.ndarray, np.ndarray]:
+    """W2-OPTIMAL bin ``(edges, representatives)`` for the expected continuous spike law.
+
+    Minimizes the Wasserstein-2 distance to the layer's expected continuous law of ``A``:
+    ``N(mean, std^2)`` for a pre-activation grid (``rectified=False``), or the rectified
+    Gaussian ``max(N(mean, std^2), 0)`` for a post-ReLU grid (``rectified=True`` -- the
+    0-atom of mass ``Phi(-mean/std)`` is given its own representative at 0, and the positive
+    tail is Lloyd-Max-quantized with the remaining ``num_bins-1`` points). Drop-in alternative
+    to ``make_gaussian_edges`` / ``make_relu_post_edges``; also returns the optimal reps
+    (cell centroids) -- the linear/ReLU steps recompute reps dynamically, so the edges are
+    what matters at grid-build time.
+    """
+    std = max(float(std), math.sqrt(_VAR_FLOOR))
+    if not rectified:
+        e_std, v_std = _lloyd_max_interval(-np.inf, np.inf, num_bins, iters=iters)
+        return mean + std * e_std, mean + std * v_std
+    if num_bins == 1:
+        return np.array([0.0, np.inf]), np.array([max(mean, 0.0)])
+    a0 = -mean / std                                          # standardized location of 0
+    _e_pos, v_pos = _lloyd_max_interval(a0, np.inf, num_bins - 1, iters=iters)  # positive tail reps
+    reps = np.empty(num_bins)
+    reps[0] = 0.0                                             # the dead-ReLU 0-atom representative
+    reps[1:] = np.maximum(mean + std * v_pos, 0.0)
+    edges = np.empty(num_bins + 1)
+    edges[0] = 0.0
+    edges[1:-1] = 0.5 * (reps[:-1] + reps[1:])               # Lloyd-Max nearest-rep boundaries
+    edges[-1] = np.inf
+    return np.maximum.accumulate(edges), reps
 
 
 # --------------------------------------------------------------------------- #

@@ -22,6 +22,9 @@ training/         the training loop (Trainer/TrainConfig) + a grid-runner CLI
 analysis/         circuit tools (analysis/Tools/, re-exported at package level)
 Mecha_preds/      mechanistic predictors
   cumulants/        cumulant propagation as a predictor (+ exact ReLU-covariance variant)
+    relu_integrals.py   CANONICAL torch-free Gaussian-ReLU integrals (relu_moments_1d,
+                        exact_relu_covariance) shared by every torch-free predictor
+    _cumulant_math.py   shared Hermite He_p + moment<->cumulant conversions
     kprop/            the vendored kprop algorithm (from the ARC paper repo)
     swkprop/          shifted-weight kprop: all-ones special direction, √n weight shift
     spikekprop/       spike kprop: ANY unit spike direction v, O(1)-eigenvalue spike M=W'+θvvᵀ

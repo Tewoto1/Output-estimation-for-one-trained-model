@@ -153,7 +153,43 @@ def mc_reference(n, depth, seed, samples, batch, *, theta=THETA, out_dim=OUT_DIM
 def relerr(a, b): return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-30))
 def slope(xs, ys): return float(np.polyfit(np.log(np.asarray(xs, float)), np.log(np.asarray(ys, float)), 1)[0])
 def eff_bins(p): p = p[p > 0]; return float(np.exp(-(p * np.log(p)).sum()))
-print("helpers ready (coordinate_spike_net, mc_reference[cached, cpu/cuda], relerr, slope, eff_bins)")
+
+import json
+# Resumable result cache: each scalar point is stored as JSON in CKPT_DIR/pts, so a Colab
+# disconnect RESUMES the sweep instead of recomputing it (the big widths take minutes).
+def cached_scalar(tag, fn):
+    path = os.path.join(CKPT_DIR, "pts", tag + ".json"); os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        return json.load(open(path))["v"]
+    v = float(fn()); json.dump({"v": v}, open(path, "w")); return v
+
+def _have_kprop():
+    try:
+        import torch  # noqa
+        from model import ModelConfig  # noqa
+        from Mecha_preds.cumulants import run_cumulants  # noqa
+        return True
+    except Exception:
+        return False
+KPROP_OK = _have_kprop()
+
+# Ordinary K=2 kprop baseline -- the REAL baseline (keeps the spiked coordinate's variance and
+# its covariance with the bulk, truncating only its O(1) order->=3 cumulants). Built on the SAME
+# spiked weights as coordinate_spike_net, so binned / MC / kprop all see one identical net.
+def kprop_k2_pred(n, depth, seed, *, exact_cov=True):
+    import torch
+    from model import ModelConfig
+    from Mecha_preds.cumulants import run_cumulants
+    Ws = coordinate_spike_net(n, depth, seed)
+    m = ModelConfig(input_dim=n, hidden_dim=n, depth=depth, output_dim=Ws[-1][0].shape[0],
+                    bias=False, final_bias=False, activation="relu").build().double().eval()
+    with torch.no_grad():
+        for i, lin in enumerate(list(m.hidden_layers) + [m.readout]):
+            lin.weight.copy_(torch.as_tensor(Ws[i][0], dtype=torch.float64))
+    return run_cumulants(m, config={"k_max": 2, "exact_relu_cov": bool(exact_cov)})["mean"]
+
+print("helpers ready (coordinate_spike_net, mc_reference[cached], cached_scalar[resumable], "
+      f"kprop_k2_pred, relerr, slope, eff_bins) | ordinary-kprop baseline available: {KPROP_OK}")
 """)
 
 # =============================================================================
@@ -197,41 +233,62 @@ plt.legend(); plt.tight_layout(); plt.show()
 """)
 
 # =============================================================================
-md(r"""## §4 — The width scaling law: $\mathrm{MSE}\sim n^{-2}$  (widths 16 … 1536)
+md(r"""## §4 — The width scaling law: $\mathrm{MSE}\sim n^{-2}$, vs ordinary kprop $k{=}2$  (widths 16 … 1536)
 
-Seed-averaged relative **MSE** vs width for binned-$K2$ (`num_bins=21`) and the naive single-bin
-closure. Binned should track the **$K=2$ rate $n^{-2}$**; single-bin only $\sim n^{-1}$.
+Seed-averaged relative **MSE** vs width for binned-$K2$ (`num_bins=21`) and the **proper baseline,
+ordinary $K{=}2$ kprop** (`run_cumulants` with the exact bivariate ReLU covariance). Ordinary kprop
+treats the spiked coordinate as an ordinary cumulant coordinate: it *keeps* that coordinate's variance
+and its covariance with the bulk, and truncates only its order-$\ge 3$ cumulants — which are $O(1)$ for
+a coordinate spike, and are exactly what the explicit binning restores. The question: does binning the
+spike direction beat the standard method?
 
-**MC-noise caveat at large $n$.** The binned RMS error falls like $n^{-1}$, so at the biggest widths
-it can dip **below** what Monte-Carlo can resolve at `MC_SAMPLES`. We print the MC-noise floor and fit
-the slope only over widths where the signal is above it (use `MC_DEVICE="cuda"` + more samples to push
-the floor down). Reaching the floor is itself consistent with the error being tiny.""")
+We do **not** use "1-bin binning" as a baseline. Collapsing the spike coordinate to a point mass is
+*strictly worse* than kprop — it throws away the spike's variance entirely (not just its higher
+cumulants), so it's a degenerate floor, not a fair comparison (empirically it's stuck at an $O(1)$
+error that never improves with width).
+
+**Resumable.** Each $(n,\text{seed})$ point is cached to `CKPT_DIR/pts` and prints a `[Progress]`
+line, so a Colab disconnect **resumes** the sweep instead of restarting. (MC-noise caveat at large $n$:
+the error can dip below MC resolution — noise-limited points are flagged; push the floor down with
+`MC_DEVICE="cuda"`.)""")
 code(r"""
-mse_b, mse_s, noise = [], [], []
+mse_b, mse_k, noise = [], [], []
 for n in SCALE_WIDTHS:
-    eb, es, nz = [], [], []
+    eb, ek, nz = [], [], []
     for s in SCALE_SEEDS:
-        Ws = coordinate_spike_net(n, SCALE_DEPTH, s); mc, se = mc_reference(n, SCALE_DEPTH, s, MC_SAMPLES, MC_BATCH)
-        eb.append(relerr(run_binned_kprop_k2(Ws, n, num_bins=SCALE_NUMBINS, bulk_relu=BULK_RELU)["mean"], mc))
-        es.append(relerr(run_binned_kprop_k2(Ws, n, num_bins=1, bulk_relu=BULK_RELU)["mean"], mc))
+        mc, se = mc_reference(n, SCALE_DEPTH, s, MC_SAMPLES, MC_BATCH)
         nz.append(np.linalg.norm(se) / (np.linalg.norm(mc) + 1e-30))
-    mse_b.append(np.mean(eb) ** 2); mse_s.append(np.mean(es) ** 2); noise.append(np.mean(nz) ** 2)
-mse_b, mse_s, noise = map(np.array, (mse_b, mse_s, noise))
+        eb_s = cached_scalar(f"binned_w{n}_s{s}_nb{SCALE_NUMBINS}_d{SCALE_DEPTH}",
+            lambda nn=n, ss=s, m=mc: relerr(run_binned_kprop_k2(
+                coordinate_spike_net(nn, SCALE_DEPTH, ss), nn,
+                num_bins=SCALE_NUMBINS, bulk_relu=BULK_RELU)["mean"], m))
+        ek_s = (cached_scalar(f"kpropk2_w{n}_s{s}_d{SCALE_DEPTH}",
+                    lambda nn=n, ss=s, m=mc: relerr(kprop_k2_pred(nn, SCALE_DEPTH, ss), m))
+                if KPROP_OK else float("nan"))
+        eb.append(eb_s); ek.append(ek_s)
+        print(f"[Progress] width={n:5d}, seed={s} -> binned {eb_s:.3e}   kprop-k2 {ek_s:.3e}", flush=True)
+    mse_b.append(np.mean(eb) ** 2); mse_k.append(np.nanmean(ek) ** 2); noise.append(np.mean(nz) ** 2)
+mse_b, mse_k, noise = map(np.array, (mse_b, mse_k, noise))
 resolvable = mse_b > 4 * noise                                   # signal clearly above the MC floor
 wr = np.array(SCALE_WIDTHS)[resolvable]
 sl_b = slope(wr, mse_b[resolvable]) if resolvable.sum() >= 2 else float("nan")
-sl_s = slope(SCALE_WIDTHS, mse_s)
-print("   n     MSE(binned)   MSE(1 bin)   MC-noise floor   resolvable?")
+sl_k = slope(SCALE_WIDTHS, mse_k) if KPROP_OK else float("nan")
+print("   n     MSE(binned)   MSE(kprop k=2)   MC-noise floor   resolvable?")
 for i, n in enumerate(SCALE_WIDTHS):
-    print(f"  {n:5d}  {mse_b[i]:.3e}    {mse_s[i]:.3e}    {noise[i]:.1e}      {'yes' if resolvable[i] else 'NOISE-LIMITED'}")
-print(f"  binned MSE ~ n^{sl_b:+.2f} (resolvable widths; K=2 rate n^-2) | single-bin ~ n^{sl_s:+.2f} (~n^-1)")
+    kp = f"{mse_k[i]:.3e}   " if KPROP_OK else "    --     "
+    print(f"  {n:5d}  {mse_b[i]:.3e}    {kp}    {noise[i]:.1e}      {'yes' if resolvable[i] else 'NOISE-LIMITED'}")
+print(f"  binned MSE ~ n^{sl_b:+.2f}  (resolvable widths; K=2 rate n^-2)" +
+      (f"  |  ordinary kprop k=2 MSE ~ n^{sl_k:+.2f}" if KPROP_OK else
+       "  |  (install torch to add the ordinary-kprop baseline)"))
 w = np.array(SCALE_WIDTHS, float)
-plt.figure(figsize=(5.6, 3.9))
+plt.figure(figsize=(5.8, 4.0))
 plt.loglog(w, mse_b, "o-", label=f"binned-K2 ({SCALE_NUMBINS} bins) ~ n^{sl_b:+.2f}")
-plt.loglog(w, mse_s, "s-", label=f"single bin ~ n^{sl_s:+.2f}")
+if KPROP_OK:
+    plt.loglog(w, mse_k, "s--", label=f"ordinary kprop k=2 ~ n^{sl_k:+.2f}")
 plt.loglog(w, noise, ":", c="gray", label="MC-noise floor")
-plt.loglog(w, mse_b[0] * (w / w[0]) ** -2.0, "k--", alpha=.6, label="$n^{-2}$ (K=2)")
-plt.xlabel("width n"); plt.ylabel("relative MSE vs MC"); plt.title(f"K=2 width scaling (depth={SCALE_DEPTH})")
+plt.loglog(w, mse_b[0] * (w / w[0]) ** -2.0, "k--", alpha=.6, label="$n^{-2}$ (K=2 target)")
+plt.xlabel("width n"); plt.ylabel("relative MSE vs MC")
+plt.title(f"binned vs ordinary kprop k=2 (coordinate spike, depth={SCALE_DEPTH})")
 plt.legend(fontsize=8); plt.tight_layout(); plt.show()
 """)
 

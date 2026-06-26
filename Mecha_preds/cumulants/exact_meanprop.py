@@ -15,10 +15,9 @@ normal pdf/cdf)::
     E[ReLU(Z)^2] = (mu^2 + sigma^2)*Phi(alpha) + mu*sigma*phi(alpha)
     Var[ReLU(Z)] = E[ReLU(Z)^2] - E[ReLU(Z)]^2
 
-These are the same closed forms implemented (and validated to ~1e-15) in
-``kprop.exact_relu_covariance.relu_moments_1d_np``; this module reproduces them
-self-contained (numpy + an optional scipy ``ndtr``, falling back to ``math.erf``)
-so it imports with no torch/scipy hard dependency and runs in float64.
+These are the same closed forms as the canonical ``relu_integrals.relu_moments_1d``
+(validated to ~1e-15), which this module now calls directly instead of re-implementing
+its own copy. Torch-free (numpy + scipy), float64.
 
 How it differs from the default k=1 "mean-prop"
 -----------------------------------------------
@@ -48,47 +47,21 @@ Usage
     print(compare_means(pred, mc, st)["relative_error_mean"])
 """
 from __future__ import annotations
-from math import erf, sqrt
 from typing import Optional
 import numpy as np
 
-_SQRT2 = sqrt(2.0)
-_INV_SQRT_2PI = 1.0 / sqrt(2.0 * np.pi)
-
-try:                                            # exact, vectorised standard-normal CDF
-    from scipy.special import ndtr as _Phi
-except Exception:                               # dependency-light fallback (no scipy)
-    _erf_vec = np.vectorize(erf)
-
-    def _Phi(x):                                # 0.5*(1+erf(x/sqrt2)) == Phi(x)
-        return 0.5 * (1.0 + _erf_vec(np.asarray(x, dtype=np.float64) / _SQRT2))
-
-
-def _phi(x):
-    x = np.asarray(x, dtype=np.float64)
-    return np.exp(-0.5 * x * x) * _INV_SQRT_2PI
+from .relu_integrals import relu_moments_1d
 
 
 # --------------------------------------------------------------------------- #
 def relu_gaussian_moments(mu, var, *, var_eps: float = 1e-12):
-    """Exact (mean, second moment, variance) of ``ReLU(Z)`` for ``Z ~ N(mu, var)``,
-    elementwise. Coordinates with ``var <= var_eps`` collapse to the point mass
-    ``ReLU(mu)`` (mean = max(mu,0), variance = 0). Reproduces, elementwise, the
-    ``relu_moments_1d_np`` closed form."""
-    mu = np.asarray(mu, dtype=np.float64)
+    """Exact ``(mean, second moment, variance)`` of ``ReLU(Z)`` for ``Z ~ N(mu, var)``,
+    elementwise (coordinates with ``var <= var_eps`` collapse to the point mass
+    ``ReLU(mu)``). Thin wrapper over the canonical ``relu_integrals.relu_moments_1d`` --
+    kept as a public name for backward compatibility; ``var`` is clipped to >= 0 first
+    (mean-prop variances are always nonnegative, so the strict-negative guard never trips)."""
     var = np.clip(np.asarray(var, dtype=np.float64), 0.0, None)
-    det = var <= var_eps
-    sigma = np.sqrt(np.where(det, 1.0, var))          # safe; det entries overwritten below
-    alpha = mu / sigma
-    Phi = _Phi(alpha)
-    phi = _phi(alpha)
-    mean_stoch = mu * Phi + sigma * phi
-    second_stoch = (mu * mu + var) * Phi + mu * sigma * phi
-    mean_det = np.maximum(mu, 0.0)
-    mean = np.where(det, mean_det, mean_stoch)
-    second = np.where(det, mean_det * mean_det, second_stoch)
-    var_out = np.where(det, 0.0, np.clip(second - mean * mean, 0.0, None))
-    return mean, second, var_out
+    return relu_moments_1d(mu, var, var_eps=var_eps)
 
 
 def _weight_bias(linear):

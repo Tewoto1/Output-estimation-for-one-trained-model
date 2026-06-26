@@ -24,6 +24,9 @@ conditional bulk mean + covariance.
 - `K > 2` (conditional cumulant *tensors* per bin) hooks into the ordinary harmonic
   kprop — `kprop_hook` imports and calls `Mecha_preds.cumulants.kprop`.
 
+Full derivation (algebra of every step + the Wasserstein bin-placement) is in
+[ALGORITHM.md](ALGORITHM.md).
+
 ## What's inside
 
 ```
@@ -31,7 +34,7 @@ __init__.py     public API (re-exports the K=2 core + the MLP adapter)
 core.py         the K=2 algorithm, numpy/scipy, TORCH-FREE:
                   BinnedK2State, normal_interval_stats, linear_step_k2, relu_step_k2,
                   gaussian_initial_state, run_binned_kprop_k2, unconditional_mean[_cov]
-_relu.py        Gaussian-ReLU backend (reuses ..cumulants.swkprop.relu; path-load
+_relu.py        Gaussian-ReLU backend (reuses ..cumulants.relu_integrals; path-load
                   fallback so the K=2 core imports with only numpy+scipy)
 kprop_hook.py   bridge to ORDINARY harmonic kprop (needs torch):
                   bulk_relu_kprop (K=2 bulk-ReLU backend, bulk_relu="kprop"),

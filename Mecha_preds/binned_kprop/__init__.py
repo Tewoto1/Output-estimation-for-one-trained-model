@@ -33,6 +33,7 @@ from .core import (
     project_to_psd,
     make_gaussian_edges,
     make_relu_post_edges,
+    lloyd_max_edges,
     gaussian_initial_state,
     linear_step_k2,
     relu_step_k2,
@@ -52,7 +53,7 @@ __all__ = [
     # K=2 core
     "BinnedK2State", "normal_interval_stats", "find_bin", "safe_bin_representative",
     "symmetrize", "project_to_psd", "make_gaussian_edges", "make_relu_post_edges",
-    "gaussian_initial_state", "linear_step_k2", "relu_step_k2",
+    "lloyd_max_edges", "gaussian_initial_state", "linear_step_k2", "relu_step_k2",
     "unconditional_mean", "unconditional_mean_cov", "run_binned_kprop_k2", "SPIKE_COORD",
     # MLP adapter
     "run_binned_kprop", "default_binned_kprop_config", "config_summary", "extract_mean",

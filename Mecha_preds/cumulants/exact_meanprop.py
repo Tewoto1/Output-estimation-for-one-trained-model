@@ -15,7 +15,7 @@ normal pdf/cdf)::
     E[ReLU(Z)^2] = (mu^2 + sigma^2)*Phi(alpha) + mu*sigma*phi(alpha)
     Var[ReLU(Z)] = E[ReLU(Z)^2] - E[ReLU(Z)]^2
 
-These are the same closed forms as the canonical ``relu_integrals.relu_moments_1d``
+These are the same closed forms as the canonical ``_utils.relu_moments_1d``
 (validated to ~1e-15), which this module now calls directly instead of re-implementing
 its own copy. Torch-free (numpy + scipy), float64.
 
@@ -50,14 +50,14 @@ from __future__ import annotations
 from typing import Optional
 import numpy as np
 
-from .relu_integrals import relu_moments_1d
+from .._utils import relu_moments_1d
 
 
 # --------------------------------------------------------------------------- #
 def relu_gaussian_moments(mu, var, *, var_eps: float = 1e-12):
     """Exact ``(mean, second moment, variance)`` of ``ReLU(Z)`` for ``Z ~ N(mu, var)``,
     elementwise (coordinates with ``var <= var_eps`` collapse to the point mass
-    ``ReLU(mu)``). Thin wrapper over the canonical ``relu_integrals.relu_moments_1d`` --
+    ``ReLU(mu)``). Thin wrapper over the canonical ``_utils.relu_moments_1d`` --
     kept as a public name for backward compatibility; ``var`` is clipped to >= 0 first
     (mean-prop variances are always nonnegative, so the strict-negative guard never trips)."""
     var = np.clip(np.asarray(var, dtype=np.float64), 0.0, None)

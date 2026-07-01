@@ -148,7 +148,7 @@ E[\rho(B_i)^2]=(\mu_i^2+\sigma_i^2)\Phi(z_i)+\mu_i\sigma_i\varphi(z_i),$$
 
 giving `μ̃_{α,i}=E[ρ(B_i)]`, `Σ̃_{α,ii}=E[ρ(B_i)^2]−μ̃_{α,i}^2`. Off-diagonal (default backend `"exact"`)
 is the **exact bivariate-Gaussian** covariance `Cov(ρ(B_i),ρ(B_j))` via Owen's-T
-(`relu_integrals.exact_relu_covariance`); the cheaper `"gain"` backend uses the leading-order
+(`_utils.exact_relu_covariance`); the cheaper `"gain"` backend uses the leading-order
 `Σ̃_{ij}=Φ(z_i)Φ(z_j)\,Σ_{ij}`; `"kprop"` delegates to the ordinary harmonic kprop ReLU.
 
 ### 5.2 Spike + merge
@@ -219,15 +219,28 @@ Lloyd–Max(f, m):
 ### 7.3 The expected continuous distribution per layer
 At each layer the closure gives `A`'s expected continuous law in closed form, and we quantize *that*:
 
-- **Pre-activation grid** (before a linear step): `A⁺` is, under the `K=2` closure, `N(m_{A^+}, s_{A^+}^2)`
-  with the analytic marginal moments
-  `m_{A^+}=∑_α p_α m_{Y,α}`, `s_{A^+}^2=∑_α p_α(m_{Y,α}^2+s_{Y,α}^2)-m_{A^+}^2` (from (2)). Includes
-  negatives — `A⁺` can be `<0` even when the incoming `A≥0`.
-- **Post-ReLU grid:** `A_{\text{post}}=\max(A_{\text{pre}},0)` is a **rectified Gaussian** — an atom at 0
-  of mass `Φ(−m/σ)` plus a positive truncated-normal tail. Its `W₂`-optimal quantizer puts **one
-  representative exactly on the 0-atom** and Lloyd–Max points on the positive tail.
+- **Pre-activation grid** (before a linear step): `A⁺` is, under the `K=2` closure, **exactly a Gaussian
+  mixture** — one component per current bin,
+  $$\mathcal L(A^+)=\sum_\alpha p_\alpha\,\mathcal N\!\big(m_{Y,\alpha},\,s_{Y,\alpha}^2\big),\qquad
+  m_{Y,\alpha}=\gamma v_\alpha+r^\top\mu_\alpha,\ \ s_{Y,\alpha}^2=r^\top\Sigma_\alpha r .$$
+  Includes negatives (`A⁺` can be `<0` even when the incoming `A≥0`).
+  **The cell centroid under a mixture is closed form** (no quadrature): with
+  `α_k=(a−m_k)/s_k`, `β_k=(b−m_k)/s_k`,
+  $$E[A^+\mid[a,b)]=\frac{\sum_k w_k\big[m_k(\Phi(\beta_k)-\Phi(\alpha_k))+s_k(\varphi(\alpha_k)-\varphi(\beta_k))\big]}
+  {\sum_k w_k(\Phi(\beta_k)-\Phi(\alpha_k))}.$$
+  This is *exactly* the linear step's representative `v^+_\beta=\sum_\alpha\eta_{\alpha\mid\beta}E[Y_\alpha\mid I_\beta]`
+  (since `η_{α|β}=p_α Q_{βα}/p^+_β` and `Q_{βα}` is component `α`'s mass in the cell). So in the
+  propagation the per-bin expected value is the **exact mixture centroid**, never a single-Gaussian
+  approximation.
+- **Post-ReLU grid:** `A_{\text{post}}=\max(A_{\text{pre}},0)` is the **rectified mixture** — an atom at 0
+  of mass `∑_k w_k Φ(−m_k/s_k)` plus a positive truncated mixture tail. Its `W₂`-optimal quantizer puts
+  **one representative on the 0-atom** and Lloyd–Max points on the positive tail.
 
-`lloyd_max_edges(mean, std, num_bins, rectified=…)` returns the `W₂`-optimal `(edges, reps)` for both.
+Two grid builders: `lloyd_max_edges(mean, std, num_bins, rectified=…)` Lloyd-Maxes a single
+moment-matched Gaussian (cheap, unimodal), while `lloyd_max_edges_mixture(weights, means, stds,
+num_bins, rectified=…)` Lloyd-Maxes the **true mixture** using the closed-form centroid above — every
+iteration closed form, no quadrature. On a 3-component test the mixture version cut `W₂²` to the true
+law by 14–28% vs the moment-matched one.
 
 ### 7.4 Why `W₂`-optimal beats equal-mass quantiles
 Equal-mass quantiles put point density `∝ f`. The `W₂` (squared-error) optimum puts point density
@@ -249,9 +262,15 @@ constant `C`, and the gap widens with `m`.
 - **Representatives** are already `W₂`-optimal everywhere (conditional means in §3–§5).
 - **Default edges** are equal-mass quantiles (`make_gaussian_edges` / `make_relu_post_edges`) — simple and
   guaranteed non-empty (good for the transition kernel), but not `W₂`-optimal.
-- **`W₂`-optimal edges** are available via `lloyd_max_edges` (centroid reps + midpoint edges; the 0-atom
-  pinned for the rectified/post case). Verified: interior edges equal the midpoints of adjacent reps, and
-  the distortion matches the table above.
+- **`W₂`-optimal edges** are available via `lloyd_max_edges` (single moment-matched Gaussian) and
+  `lloyd_max_edges_mixture` (the exact mixture, closed-form centroids) — both: centroid reps + midpoint
+  edges, with the 0-atom pinned for the rectified/post case. Verified: interior edges equal the midpoints
+  of adjacent reps, the single-Gaussian distortions match the table above, and the mixture version is
+  exact for the true `A⁺` law.
+- **Note** these are grid *utilities*; the propagation loop currently still builds equal-mass quantile
+  grids once and reuses them. Wiring a per-layer `lloyd_max_edges_mixture` re-grid (the spike mixture is
+  rebuilt from `(p, m_Y, s_Y)` each layer) is the principled "dynamic `W₂` binning" — and since the
+  representatives are *already* exact mixture centroids, only the edges would change.
 
 A practical caveat from the width experiments: past ≈ 4–7 bins the predictor's accuracy is limited by the
 **bulk `K=2` Gaussian closure**, not by the spike discretization, so `W₂`-optimal binning mainly lets you
@@ -286,4 +305,4 @@ $$E[A\mid a≤A<b]=\frac{φ(a)−φ(b)}{Z},\qquad
 Rectified Gaussian moments `Y~N(μ,σ²)`, `z=μ/σ`:
 `E[ρ(Y)]=μΦ(z)+σφ(z)`, `E[ρ(Y)²]=(μ²+σ²)Φ(z)+μσφ(z)`, atom mass `P(Y≤0)=Φ(−z)`.
 
-All implemented torch-free in `Mecha_preds.cumulants.relu_integrals` (canonical) and used by `core.py`.
+All implemented torch-free in `Mecha_preds._utils` (canonical shared kernel) and used by `core.py`.

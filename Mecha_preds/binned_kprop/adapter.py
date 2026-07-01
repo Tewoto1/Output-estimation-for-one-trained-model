@@ -23,7 +23,7 @@ from typing import Optional
 
 import numpy as np
 
-from .core import run_binned_kprop_k2, SPIKE_COORD
+from .core import run_binned_kprop_k2, resolve_workers, SPIKE_COORD
 
 
 def default_binned_kprop_config() -> dict:
@@ -31,8 +31,11 @@ def default_binned_kprop_config() -> dict:
     ``num_bins_post`` sizes the post-ReLU grid (default = ``num_bins``); ``bulk_relu``
     is the per-bin bulk-ReLU backend ('exact' = exact bivariate covariance, 'gain' =
     leading-order spec-8.2 gain, 'kprop' = delegate to harmonic kprop); ``input_std``
-    is the Gaussian input scale."""
-    return {"num_bins": 21, "num_bins_post": None, "bulk_relu": "exact", "input_std": 1.0}
+    is the Gaussian input scale; ``workers`` is the per-bin thread count -- ``"auto"``
+    (default) parallelizes per machine (CUDA box -> 8, else min(8, cpu_count); env override
+    ``BINNED_KPROP_WORKERS``), pass ``1`` for serial."""
+    return {"num_bins": 21, "num_bins_post": None, "bulk_relu": "exact", "input_std": 1.0,
+            "grid": "fixed", "workers": "auto"}
 
 
 def config_summary(config: Optional[dict] = None) -> str:
@@ -40,7 +43,9 @@ def config_summary(config: Optional[dict] = None) -> str:
     if config:
         c.update(config)
     npost = c["num_bins_post"] if c["num_bins_post"] is not None else c["num_bins"]
-    return f"BINNED-KPROP(K=2, num_bins={c['num_bins']}, post={npost}, bulk_relu={c['bulk_relu']})"
+    return (f"BINNED-KPROP(K=2, num_bins={c['num_bins']}, post={npost}, "
+            f"grid={c.get('grid', 'fixed')}, bulk_relu={c['bulk_relu']}, "
+            f"workers={resolve_workers(c.get('workers', 'auto'))})")
 
 
 def _weights_from_model(model):
@@ -88,9 +93,10 @@ def run_binned_kprop(model, input_dim: Optional[int] = None, config: Optional[di
             weights[li] = (W, _b)
 
     res = run_binned_kprop_k2(
-        weights, input_dim, num_bins=int(cfg["num_bins"]),
+        weights, input_dim, num_bins=int(cfg["num_bins"]), grid=str(cfg.get("grid", "fixed")),
         num_bins_post=(None if cfg["num_bins_post"] is None else int(cfg["num_bins_post"])),
         input_std=float(cfg["input_std"]), bulk_relu=str(cfg["bulk_relu"]),
+        workers=cfg.get("workers", "auto"),
         collect=collect)
     res["metadata"]["config"] = config_summary(config)
     res["metadata"]["add_spike"] = bool(add_spike)

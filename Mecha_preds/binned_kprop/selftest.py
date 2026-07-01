@@ -150,15 +150,17 @@ def run(verbose: bool = True) -> bool:
     mc, se = mc_output_mean(Ws, n, 3_000_000, 300_000, seed=123)
     err = {nb: _rel(run_binned_kprop_k2(Ws, n, num_bins=nb)["mean"], mc)
            for nb in (1, 5, 21)}
+    err_w2 = _rel(run_binned_kprop_k2(Ws, n, num_bins=21, grid="wasserstein")["mean"], mc)
     refine_ok = err[21] < err[5] < err[1]              # more bins -> less error
     helps_ok = err[21] < 0.25 * err[1]                 # binning is a big win
     small_ok = err[21] < 0.05                          # many-bin error is small
-    t4_ok = refine_ok and helps_ok and small_ok
+    w2_ok = np.isfinite(err_w2) and err_w2 < 0.05       # wasserstein grid runs & is comparable
+    t4_ok = refine_ok and helps_ok and small_ok and w2_ok
     ok &= t4_ok
     if verbose:
         print(f"[4] end-to-end vs MC (n={n}, depth={depth}): "
-              f"err 1bin {err[1]:.2e} -> 5 {err[5]:.2e} -> 21 {err[21]:.2e}   "
-              f"{'OK' if t4_ok else 'FAIL'}")
+              f"err 1bin {err[1]:.2e} -> 5 {err[5]:.2e} -> 21 {err[21]:.2e} "
+              f"(W2-grid {err_w2:.2e})   {'OK' if t4_ok else 'FAIL'}")
 
     # 5. degenerate cases ------------------------------------------------------
     # (a) r = 0  -> A^+ = gamma A deterministic inside each old bin.

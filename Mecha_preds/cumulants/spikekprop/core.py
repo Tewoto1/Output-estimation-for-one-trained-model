@@ -69,7 +69,7 @@ ReLU step
     d3..dR by the Edgeworth/Gram-Charlier series for R>=3), run the EXACT rank-2 Gaussian-ReLU
     step on the O(1) conditional law at each Gauss-Hermite node, and mix.
 
-The core is numpy-only (scipy for the ReLU integrals, from the canonical ``..relu_integrals``).
+The core is numpy-only (scipy for the ReLU integrals, from the canonical ``Mecha_preds._utils``).
 ``run_spike_kprop`` in ``adapter.py`` wraps a torch ``model.MLP``.
 """
 from __future__ import annotations
@@ -83,7 +83,7 @@ from numpy.polynomial.hermite import hermgauss
 # The canonical, direction-independent Gaussian-ReLU kernel (numpy/scipy, torch-free).
 # ``_phi``/``_Phi`` are the scipy-backed standard-normal pdf/cdf used everywhere here, so
 # the analytic Wick coefficients below match ``kprop.wick.relu_wick_coef`` numerically.
-from ..relu_integrals import relu_moments_1d, exact_relu_covariance, _phi, _Phi
+from ..._utils import relu_moments_1d, exact_relu_covariance, _phi, _Phi
 
 _TINY = 1e-30
 _VAR_FLOOR = 1e-12

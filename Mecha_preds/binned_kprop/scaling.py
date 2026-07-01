@@ -49,7 +49,7 @@ def fit_loglog_slope(widths: Sequence[int], errs: Sequence[float]) -> float:
 def width_scaling(widths: Sequence[int] = (32, 64, 128), *, depth: int = 2,
                   num_bins: int = 31, seeds: Sequence[int] = (10, 11, 12, 13),
                   samples: int = 2_500_000, batch: int = 250_000, theta: float = 1.0,
-                  out_dim: int = 8, bulk_relu: str = "exact") -> Dict[str, object]:
+                  out_dim: int = 8, bulk_relu: str = "exact", grid: str = "fixed") -> Dict[str, object]:
     """Seed-averaged binned-K2 vs single-bin error across widths, with fitted exponents.
 
     Metric: relative L2 error of the predicted output-mean VECTOR (``out_dim`` random
@@ -64,7 +64,7 @@ def width_scaling(widths: Sequence[int] = (32, 64, 128), *, depth: int = 2,
         for s in seeds:
             Ws = coordinate_spike_net(n, depth, seed=s, theta=theta, out_dim=out_dim)
             mc, se = mc_output_mean(Ws, n, samples, batch, seed=1000 + s)
-            eb.append(_rel(run_binned_kprop_k2(Ws, n, num_bins=num_bins, bulk_relu=bulk_relu)["mean"], mc))
+            eb.append(_rel(run_binned_kprop_k2(Ws, n, num_bins=num_bins, grid=grid, bulk_relu=bulk_relu)["mean"], mc))
             es.append(_rel(run_binned_kprop_k2(Ws, n, num_bins=1, bulk_relu=bulk_relu)["mean"], mc))
             nz.append(float(np.linalg.norm(se) / (np.linalg.norm(mc) + 1e-30)))
         rms_binned.append(float(np.mean(eb)))

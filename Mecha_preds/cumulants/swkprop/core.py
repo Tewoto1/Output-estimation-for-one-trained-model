@@ -46,7 +46,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 from numpy.polynomial.hermite import hermgauss
 
-from ..relu_integrals import relu_moments_1d, exact_relu_covariance
+from ..._utils import relu_moments_1d, exact_relu_covariance
 # Hermite He_p and the central-moment -> cumulant conversion are shared (one copy) in
 # ``.._cumulant_math``; imported here under their original private names.
 from .._cumulant_math import He as _He, central_moments_to_cumulants as _central_moments_to_cumulants

@@ -10,8 +10,8 @@ fails; this predictor represents that coordinate EXPLICITLY by a hidden-Markov m
 Sections (knobs live HERE; MC references cached -> nothing recomputed on re-run):
   §1  config + spiked-net builder + cached MC (numpy, or torch-GPU for the big widths)
   §2  sanity: binned-K2 vs MC on one net (output-mean parity)
-  §3  num_bins REFINEMENT at fixed width -> the bulk-closure floor
-  §4  the WIDTH SCALING LAW: binned-K2 rel-MSE ~ n^-2  (widths 16 ... 1536)
+  §3  do MORE bins help at HIGHER width? (num_bins sweep at the larger widths)
+  §4  WIDTH SCALING: fixed bins vs width-SCALED bins vs ordinary kprop k=2 (widths 16 ... 1536)
   §5  practical TUNING table (num_bins vs accuracy/time, recommended num_bins)
   §6  BIN-MASS PROFILE: where does the probability mass sit? (the 0-atom; effective #bins)
   §7  ROBUSTNESS: does MSE~n^-2 survive a *ton* of bins? (stability: mass + PSD)
@@ -78,24 +78,38 @@ QUICK     = True                # set False for the full sweep (slow at the big 
 THETA     = 1.0                 # coordinate spike: M = W + THETA e1 e1^T
 OUT_DIM   = 8                   # readout width -> output mean is a VECTOR (stable error norm)
 BULK_RELU = "exact"             # per-bin bulk-ReLU backend: "exact" | "gain" | "kprop"(torch)
-MC_DEVICE = "cpu"               # "cpu" (numpy) or "cuda" (torch GPU forward; recommended for n>=512)
+MC_DEVICE = "cpu" if QUICK else "cuda"   # numpy on CPU; torch GPU forward (recommended for n>=512)
+BINNED_GRID = "wasserstein"     # bin placement: "wasserstein" (Lloyd-Max over ALL reals) | "fixed"
 
 # width sweeps (the headline goes up to 1536)
 SCALE_WIDTHS  = [16, 32, 64, 128] if QUICK else [16, 32, 64, 128, 256, 512, 1024, 1536]
 SCALE_DEPTH   = 2
-SCALE_NUMBINS = 21              # enough bins to see the n^-2 rate (past the discretization knee)
-SCALE_SEEDS   = [10, 11] if QUICK else [10, 11, 12]
-MC_SAMPLES    = 2_000_000 if QUICK else 4_000_000
+SCALE_NUMBINS = 21              # BASE bin count (at width BIN_REF_W); SCALED UP with width below
+SCALE_SEEDS   = [10, 11]
+MC_SAMPLES    = 2_000_000 if QUICK else 10_000_000
 MC_BATCH      = 200_000
 
-REFINE_WIDTH, REFINE_NUMBINS = 64, [1, 3, 7, 15, 31]
+# Scale the number of bins WITH model width: the W2 grid spreads bins over ALL reals and a wider
+# model has a lower bulk-K2 floor, so larger models can use more bins.
+#   num_bins(n) = clip( SCALE_NUMBINS * (n / BIN_REF_W) ** BIN_GROWTH ,  3 , BIN_CAP )
+BIN_GROWTH = 0.5                # 0 = fixed bins; 0.5 = sqrt(width); 1 = linear in width
+BIN_REF_W  = 64                 # reference width at which num_bins == SCALE_NUMBINS
+BIN_CAP    = 129                # safety cap (predictor cost ~ num_bins * width^3)
+def num_bins_for(n):
+    return int(np.clip(round(SCALE_NUMBINS * (n / BIN_REF_W) ** BIN_GROWTH), 3, BIN_CAP))
+
+# "do MORE bins help at HIGHER width?" -- swept at the LARGER widths (not low ones)
+HIBIN_WIDTHS  = [64, 128] if QUICK else [256, 512, 1024]
+HIBIN_NUMBINS = [7, 15, 31, 63]
 TUNE_WIDTHS   = [128, 256] if QUICK else [256, 512, 1024]
 TUNE_NUMBINS  = [7, 15, 31]
 TUNE_DEPTH    = 3
 
 CKPT_DIR = "checkpoints/binned_kprop"; os.makedirs(CKPT_DIR, exist_ok=True)
-print(f"QUICK={QUICK} | theta={THETA} | out_dim={OUT_DIM} | bulk_relu={BULK_RELU} | MC_DEVICE={MC_DEVICE}")
-print(f"scaling widths={SCALE_WIDTHS} depth={SCALE_DEPTH} num_bins={SCALE_NUMBINS} seeds={SCALE_SEEDS} MC={MC_SAMPLES:,}")
+print(f"QUICK={QUICK} | theta={THETA} | out_dim={OUT_DIM} | bulk_relu={BULK_RELU} | grid={BINNED_GRID} | MC_DEVICE={MC_DEVICE}")
+print(f"scaling widths={SCALE_WIDTHS} depth={SCALE_DEPTH} base_bins={SCALE_NUMBINS} "
+      f"-> per-width bins {[num_bins_for(n) for n in SCALE_WIDTHS]} (~width^{BIN_GROWTH}) "
+      f"seeds={SCALE_SEEDS} MC={MC_SAMPLES:,}")
 """)
 
 code(r"""
@@ -212,83 +226,92 @@ plt.title(f"parity (n={n0}, depth={depth0}, 31 bins)"); plt.tight_layout(); plt.
 """)
 
 # =============================================================================
-md(r"""## §3 — `num_bins` refinement at fixed width (the hyperparameter)
+md(r"""## §3 — Does adding bins help at **higher** width?
 
-Increasing `num_bins` removes the spike-coordinate discretization error; the total error then
-**converges to the bulk-$K2$ closure floor** (a documented $K=2$ limitation). Expect a sharp early
-drop, then a plateau — empirically ~4–7 bins already reach the floor.""")
+The question we care about is not bin-refinement at small width, but whether *scaling the bin count up
+pays off more as the model gets wider* — a wider model has a lower bulk-$K2$ floor, so the spike
+discretization can keep mattering for longer. For each of the LARGER widths in `HIBIN_WIDTHS`, we sweep
+`num_bins` (grid = `BINNED_GRID`, Lloyd-Max over all reals) and plot rel-err vs num_bins, one curve per
+width: if more bins keep helping at large width the curve keeps sloping down; if the bulk floor
+dominates it flattens.""")
 code(r"""
-rerr = []
-for nb_ in REFINE_NUMBINS:
-    es = [relerr(run_binned_kprop_k2(coordinate_spike_net(REFINE_WIDTH, SCALE_DEPTH, s), REFINE_WIDTH,
-                                     num_bins=nb_, bulk_relu=BULK_RELU)["mean"],
-                 mc_reference(REFINE_WIDTH, SCALE_DEPTH, s, MC_SAMPLES, MC_BATCH)[0]) for s in SCALE_SEEDS]
-    rerr.append(float(np.mean(es)))
-for nb_, e in zip(REFINE_NUMBINS, rerr): print(f"  num_bins={nb_:3d}   rel-err {e:.3e}")
-floor = min(rerr); print(f"  -> floor {floor:.2e}; 1-bin/floor = {rerr[0]/floor:.0f}x")
-plt.figure(figsize=(5.2, 3.6)); plt.semilogy(REFINE_NUMBINS, rerr, "o-")
-plt.axhline(floor, ls="--", c="gray", alpha=.7, label=f"closure floor {floor:.1e}")
-plt.xlabel("num_bins"); plt.ylabel("rel error vs MC"); plt.title(f"bin refinement (n={REFINE_WIDTH})")
+plt.figure(figsize=(5.8, 3.9))
+for n in HIBIN_WIDTHS:
+    errs = []
+    for nb_ in HIBIN_NUMBINS:
+        e = [relerr(run_binned_kprop_k2(coordinate_spike_net(n, SCALE_DEPTH, s), n,
+                    num_bins=nb_, grid=BINNED_GRID, bulk_relu=BULK_RELU)["mean"],
+                    mc_reference(n, SCALE_DEPTH, s, MC_SAMPLES, MC_BATCH)[0]) for s in SCALE_SEEDS]
+        errs.append(float(np.mean(e)))
+    print(f"  n={n:5d}:  " + "   ".join(f"{nb_}b->{e:.2e}" for nb_, e in zip(HIBIN_NUMBINS, errs)))
+    plt.plot(HIBIN_NUMBINS, errs, "o-", label=f"n={n}")
+plt.xlabel("num_bins"); plt.ylabel("rel error vs MC"); plt.yscale("log")
+plt.title(f"does adding bins help at higher width? (grid={BINNED_GRID}, depth={SCALE_DEPTH})")
 plt.legend(); plt.tight_layout(); plt.show()
 """)
 
 # =============================================================================
-md(r"""## §4 — The width scaling law: $\mathrm{MSE}\sim n^{-2}$, vs ordinary kprop $k{=}2$  (widths 16 … 1536)
+md(r"""## §4 — Width scaling: fixed bins vs **width-scaled** bins, vs ordinary kprop $k{=}2$  (widths 16 … 1536)
 
-Seed-averaged relative **MSE** vs width for binned-$K2$ (`num_bins=21`) and the **proper baseline,
-ordinary $K{=}2$ kprop** (`run_cumulants` with the exact bivariate ReLU covariance). Ordinary kprop
-treats the spiked coordinate as an ordinary cumulant coordinate: it *keeps* that coordinate's variance
-and its covariance with the bulk, and truncates only its order-$\ge 3$ cumulants — which are $O(1)$ for
-a coordinate spike, and are exactly what the explicit binning restores. The question: does binning the
-spike direction beat the standard method?
+The headline question: as the model gets wider, does **scaling the bin count up with width** improve the
+predictor's scaling? Seed-averaged relative **MSE** vs width for the binned predictor (grid = `BINNED_GRID`,
+Lloyd-Max over all reals) with (a) a **fixed** `SCALE_NUMBINS` bins and (b) **width-scaled** bins
+`num_bins(n) ∝ n^BIN_GROWTH`, against the baseline **ordinary $K{=}2$ kprop** (`run_cumulants`, exact
+bivariate ReLU cov) — which keeps the spike coordinate's variance but truncates its $O(1)$ order-$\ge 3$
+cumulants. If scaling bins helps, the scaled curve falls faster/further than the fixed-bins curve at large
+width; if the bulk-$K2$ closure floor dominates, the two coincide.
 
-We do **not** use "1-bin binning" as a baseline. Collapsing the spike coordinate to a point mass is
-*strictly worse* than kprop — it throws away the spike's variance entirely (not just its higher
-cumulants), so it's a degenerate floor, not a fair comparison (empirically it's stuck at an $O(1)$
-error that never improves with width).
-
-**Resumable.** Each $(n,\text{seed})$ point is cached to `CKPT_DIR/pts` and prints a `[Progress]`
-line, so a Colab disconnect **resumes** the sweep instead of restarting. (MC-noise caveat at large $n$:
-the error can dip below MC resolution — noise-limited points are flagged; push the floor down with
-`MC_DEVICE="cuda"`.)""")
+**Resumable.** Each $(n,\text{seed})$ point is cached to `CKPT_DIR/pts` and prints a `[Progress]` line,
+so a Colab disconnect **resumes** the sweep. (MC-noise caveat at large $n$: the error can dip below MC
+resolution — flagged points are excluded from the slope fit; push the floor down with more `MC_SAMPLES`
+or `MC_DEVICE="cuda"`.)""")
 code(r"""
-mse_b, mse_k, noise = [], [], []
+def _binned(n, s, mc, nbins):
+    return relerr(run_binned_kprop_k2(coordinate_spike_net(n, SCALE_DEPTH, s), n,
+                  num_bins=nbins, grid=BINNED_GRID, bulk_relu=BULK_RELU)["mean"], mc)
+
+mse_fix, mse_scl, mse_k, noise = [], [], [], []
 for n in SCALE_WIDTHS:
-    eb, ek, nz = [], [], []
+    nb_scaled = num_bins_for(n)
+    ef, es, ek, nz = [], [], [], []
     for s in SCALE_SEEDS:
         mc, se = mc_reference(n, SCALE_DEPTH, s, MC_SAMPLES, MC_BATCH)
         nz.append(np.linalg.norm(se) / (np.linalg.norm(mc) + 1e-30))
-        eb_s = cached_scalar(f"binned_w{n}_s{s}_nb{SCALE_NUMBINS}_d{SCALE_DEPTH}",
-            lambda nn=n, ss=s, m=mc: relerr(run_binned_kprop_k2(
-                coordinate_spike_net(nn, SCALE_DEPTH, ss), nn,
-                num_bins=SCALE_NUMBINS, bulk_relu=BULK_RELU)["mean"], m))
+        ef_s = cached_scalar(f"binFix_w{n}_s{s}_nb{SCALE_NUMBINS}_{BINNED_GRID}_d{SCALE_DEPTH}",
+                             lambda nn=n, ss=s, m=mc: _binned(nn, ss, m, SCALE_NUMBINS))
+        es_s = cached_scalar(f"binScl_w{n}_s{s}_nb{nb_scaled}_{BINNED_GRID}_d{SCALE_DEPTH}",
+                             lambda nn=n, ss=s, m=mc, nb=nb_scaled: _binned(nn, ss, m, nb))
         ek_s = (cached_scalar(f"kpropk2_w{n}_s{s}_d{SCALE_DEPTH}",
                     lambda nn=n, ss=s, m=mc: relerr(kprop_k2_pred(nn, SCALE_DEPTH, ss), m))
                 if KPROP_OK else float("nan"))
-        eb.append(eb_s); ek.append(ek_s)
-        print(f"[Progress] width={n:5d}, seed={s} -> binned {eb_s:.3e}   kprop-k2 {ek_s:.3e}", flush=True)
-    mse_b.append(np.mean(eb) ** 2); mse_k.append(np.nanmean(ek) ** 2); noise.append(np.mean(nz) ** 2)
-mse_b, mse_k, noise = map(np.array, (mse_b, mse_k, noise))
-resolvable = mse_b > 4 * noise                                   # signal clearly above the MC floor
-wr = np.array(SCALE_WIDTHS)[resolvable]
-sl_b = slope(wr, mse_b[resolvable]) if resolvable.sum() >= 2 else float("nan")
+        ef.append(ef_s); es.append(es_s); ek.append(ek_s)
+        print(f"[Progress] width={n:5d}, seed={s} -> binned-fixed({SCALE_NUMBINS}) {ef_s:.3e}   "
+              f"binned-scaled({nb_scaled}) {es_s:.3e}   kprop-k2 {ek_s:.3e}", flush=True)
+    mse_fix.append(np.mean(ef) ** 2); mse_scl.append(np.mean(es) ** 2)
+    mse_k.append(np.nanmean(ek) ** 2); noise.append(np.mean(nz) ** 2)
+mse_fix, mse_scl, mse_k, noise = map(np.array, (mse_fix, mse_scl, mse_k, noise))
+def _slope_res(mse):
+    res = mse > 4 * noise
+    return slope(np.array(SCALE_WIDTHS)[res], mse[res]) if res.sum() >= 2 else float("nan")
+sl_f, sl_s = _slope_res(mse_fix), _slope_res(mse_scl)
 sl_k = slope(SCALE_WIDTHS, mse_k) if KPROP_OK else float("nan")
-print("   n     MSE(binned)   MSE(kprop k=2)   MC-noise floor   resolvable?")
+print("   n   scaled-bins  MSE(fixed)   MSE(scaled)   MSE(kprop k2)  MC-noise  resolvable?")
 for i, n in enumerate(SCALE_WIDTHS):
-    kp = f"{mse_k[i]:.3e}   " if KPROP_OK else "    --     "
-    print(f"  {n:5d}  {mse_b[i]:.3e}    {kp}    {noise[i]:.1e}      {'yes' if resolvable[i] else 'NOISE-LIMITED'}")
-print(f"  binned MSE ~ n^{sl_b:+.2f}  (resolvable widths; K=2 rate n^-2)" +
-      (f"  |  ordinary kprop k=2 MSE ~ n^{sl_k:+.2f}" if KPROP_OK else
-       "  |  (install torch to add the ordinary-kprop baseline)"))
+    kp = f"{mse_k[i]:.2e}" if KPROP_OK else "  --  "
+    print(f"  {n:5d}   {num_bins_for(n):4d}     {mse_fix[i]:.2e}    {mse_scl[i]:.2e}     {kp}    "
+          f"{noise[i]:.1e}  {'yes' if mse_scl[i] > 4*noise[i] else 'NOISE-LIM'}")
+print(f"  slopes:  fixed-{SCALE_NUMBINS}-bins n^{sl_f:+.2f}   width-scaled-bins n^{sl_s:+.2f}" +
+      (f"   ordinary-kprop-k2 n^{sl_k:+.2f}" if KPROP_OK else "") + "   (K=2 target n^-2)")
 w = np.array(SCALE_WIDTHS, float)
-plt.figure(figsize=(5.8, 4.0))
-plt.loglog(w, mse_b, "o-", label=f"binned-K2 ({SCALE_NUMBINS} bins) ~ n^{sl_b:+.2f}")
+plt.figure(figsize=(6.2, 4.1))
+plt.loglog(w, mse_fix, "o-", label=f"binned, fixed {SCALE_NUMBINS} bins ~ n^{sl_f:+.2f}")
+plt.loglog(w, mse_scl, "D-", label=f"binned, bins~width^{BIN_GROWTH} ~ n^{sl_s:+.2f}")
 if KPROP_OK:
     plt.loglog(w, mse_k, "s--", label=f"ordinary kprop k=2 ~ n^{sl_k:+.2f}")
 plt.loglog(w, noise, ":", c="gray", label="MC-noise floor")
-plt.loglog(w, mse_b[0] * (w / w[0]) ** -2.0, "k--", alpha=.6, label="$n^{-2}$ (K=2 target)")
+plt.loglog(w, mse_fix[0] * (w / w[0]) ** -2.0, "k--", alpha=.6, label="$n^{-2}$ (K=2 target)")
 plt.xlabel("width n"); plt.ylabel("relative MSE vs MC")
-plt.title(f"binned vs ordinary kprop k=2 (coordinate spike, depth={SCALE_DEPTH})")
+plt.title(f"fixed vs width-scaled bins ({BINNED_GRID} grid, depth={SCALE_DEPTH})")
 plt.legend(fontsize=8); plt.tight_layout(); plt.show()
 """)
 

@@ -26,7 +26,7 @@ import numpy as np
 
 from .core import (State, initial_state, linear_step, relu_step, spike_kprop_predict,
                    unit_vector)
-from ..relu_integrals import exact_relu_covariance
+from ..._utils import exact_relu_covariance
 from ..swkprop.core import sw_kprop_predict
 
 _MM = lambda A, B: A @ B

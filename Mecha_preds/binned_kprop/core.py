@@ -36,18 +36,22 @@ State (per bin ``alpha``, K=2)::
 with bulk dimension ``d = n - 1``.  Coordinate 0 is NEVER stored inside the bulk
 mean/covariance arrays -- it lives only in ``p`` and ``a``.
 
-The ReLU integrals reuse the repo's canonical numpy/scipy kernel
-(``..cumulants.relu_integrals``); see ``_relu.py`` for the import shim.
+The ReLU integrals and the matrix helpers (``symmetrize`` / ``project_to_psd``) reuse the
+repo's shared torch-free kernel ``Mecha_preds._utils`` (imported below and re-exported here).
 """
 from __future__ import annotations
 
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
-from ._relu import _phi, _Phi, exact_relu_covariance, relu_moments_1d
+from .._utils import (
+    _phi, _Phi, exact_relu_covariance, relu_moments_1d, symmetrize, project_to_psd,
+)
 
 # Coordinate of the spike (e = e_1 -> index 0 in Python). The bulk is coords 1..n-1.
 SPIKE_COORD = 0
@@ -55,6 +59,71 @@ SPIKE_COORD = 0
 _TINY = 1e-30
 _VAR_FLOOR = 1e-12
 _DEFAULT_MIN_PROB = 1e-15
+
+
+# --------------------------------------------------------------------------- #
+# per-bin parallel map (auto thread count; resolves "auto"/None per machine)
+# --------------------------------------------------------------------------- #
+#: ``Workers`` is an explicit thread count, ``1`` for serial, or ``None`` / ``"auto"`` to
+#: auto-resolve (see ``resolve_workers``). The env var ``BINNED_KPROP_WORKERS`` overrides auto.
+Workers = Union[int, str, None]
+_WORKERS_ENV = "BINNED_KPROP_WORKERS"
+_CUDA_CACHED: Optional[bool] = None
+
+
+def _cuda_available() -> bool:
+    """``True`` if a CUDA torch build reports a device (cached). GUARDED: the numpy core
+    still imports and runs with no torch installed -- a missing/cpu torch yields ``False``,
+    so this never makes torch a hard dependency of the torch-free core."""
+    global _CUDA_CACHED
+    if _CUDA_CACHED is None:
+        try:
+            import torch  # noqa: PLC0415
+            _CUDA_CACHED = bool(torch.cuda.is_available())
+        except Exception:
+            _CUDA_CACHED = False
+    return _CUDA_CACHED
+
+
+def resolve_workers(workers: Workers = None) -> int:
+    """Resolve the per-bin thread count to a concrete ``>= 1`` (``1`` == serial).
+
+    Precedence: an explicit integer ``workers`` (``>= 1``) wins; then the env var
+    ``$BINNED_KPROP_WORKERS``; then AUTO. Auto = ``8`` on a CUDA box (the common
+    big-machine signal), else ``min(8, os.cpu_count())``. ``None`` and ``"auto"`` both mean
+    auto -- so the DEFAULT is parallel, not serial; pass ``workers=1`` to force serial.
+    """
+    if isinstance(workers, str):
+        if workers.lower() != "auto":
+            raise ValueError(f"workers must be an int, None, or 'auto'; got {workers!r}")
+        workers = None
+    if workers is not None:
+        return max(1, int(workers))
+    env = os.environ.get(_WORKERS_ENV)
+    if env:
+        return max(1, int(env))
+    if _cuda_available():
+        return 8
+    return max(1, min(8, os.cpu_count() or 1))
+
+
+def _run_bins(n: int, body: Callable[[int], object], workers: Workers) -> list:
+    """Run ``body(i)`` for ``i in range(n)`` and return the results in index order.
+
+    Serial -- bit-for-bit a plain ``[body(i) for i in range(n)]`` -- when the resolved
+    thread count (``resolve_workers(workers)``) is ``1`` or ``n <= 1``; otherwise the per-bin
+    bodies run on a ``ThreadPoolExecutor`` with ``min(workers, n)`` threads. THREADS, not
+    processes: the bin work is numpy/LAPACK-heavy (``@``, ``eigh``) and releases the GIL, no
+    pickling is needed (the output arrays are shared), and each ``body(i)`` writes ONLY to
+    disjoint slices (row/column ``i``) of those arrays -- so concurrent writes never alias.
+    Cross-bin reductions are RETURNED by ``body`` and combined by the caller, never
+    accumulated in place (which would race). Exceptions propagate as in the serial path.
+    """
+    w = resolve_workers(workers)
+    if w <= 1 or n <= 1:
+        return [body(i) for i in range(n)]
+    with ThreadPoolExecutor(max_workers=min(w, n)) as ex:
+        return list(ex.map(body, range(n)))
 
 
 # --------------------------------------------------------------------------- #
@@ -138,22 +207,8 @@ def safe_bin_representative(edges: np.ndarray, beta: int) -> float:
     return 0.5 * (lo + hi)
 
 
-def symmetrize(A: np.ndarray) -> np.ndarray:
-    return 0.5 * (A + A.T)
-
-
-def project_to_psd(A: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Clip negative eigenvalues to 0. Returns ``(A_psd, clipped_mass)`` where
-    ``clipped_mass`` is the total magnitude of the removed negative eigenvalues
-    (0 if already PSD) -- log it; it should be numerical roundoff only."""
-    A = symmetrize(A)
-    vals, vecs = np.linalg.eigh(A)
-    vmin = float(vals.min()) if vals.size else 0.0
-    if vmin >= 0.0:
-        return A, 0.0
-    clipped = float(-vals[vals < 0.0].sum())
-    A = (vecs * np.clip(vals, 0.0, None)) @ vecs.T
-    return symmetrize(A), clipped
+# ``symmetrize`` and ``project_to_psd`` are imported from the shared kernel
+# ``Mecha_preds._utils`` (see the import at the top) and re-exported via this package.
 
 
 def make_gaussian_edges(num_bins: int, *, std: float = 1.0,
@@ -276,6 +331,78 @@ def lloyd_max_edges(mean: float, std: float, num_bins: int, *, rectified: bool =
     return np.maximum.accumulate(edges), reps
 
 
+# The expected continuous law of A at a layer is, under the K=2 closure, a GAUSSIAN MIXTURE
+# (one component per old bin: A^+ = sum_alpha p_alpha N(m_Y,alpha, s_Y,alpha^2)). Its per-cell
+# mean has a CLOSED FORM -- a mass-weighted blend of each component's truncated-Gaussian first
+# moment -- so Lloyd-Max can quantize the *true* mixture, not a single moment-matched Gaussian,
+# with every iteration still closed form (no quadrature). (This is exactly the centroid the
+# linear step already computes as sum_alpha eta_{alpha|beta} E[Y_alpha | I_beta].)
+def _mixture_cell(w: np.ndarray, m: np.ndarray, s: np.ndarray, a: float, b: float
+                  ) -> Tuple[float, float]:
+    """``(mass, centroid)`` of cell ``[a,b)`` under the Gaussian mixture ``sum_k w_k N(m_k,s_k^2)``."""
+    al = (a - m) / s
+    be = (b - m) / s
+    Zc = _Phi(be) - _Phi(al)                                  # per-component mass in the cell
+    Z = float(np.sum(w * Zc))
+    if Z <= _TINY:
+        mid = 0.0 if (math.isinf(a) or math.isinf(b)) else 0.5 * (a + b)
+        return 0.0, mid
+    fm = float(np.sum(w * (m * Zc + s * (_phi(al) - _phi(be)))))   # unnormalized 1st moment
+    return Z, fm / Z
+
+
+def _lloyd_max_mixture_interval(w, m, s, lo, hi, num_pts, *, iters=1000, tol=1e-10):
+    """Lloyd-Max W2 quantizer of the Gaussian mixture restricted to ``[lo, hi)`` (closed form).
+
+    ``iters`` defaults to 1000: a multimodal mixture converges to the Lloyd fixed point more
+    slowly than a single Gaussian, and each iteration is only O(num_pts * num_components)."""
+    from scipy.special import ndtri
+    if num_pts <= 1:
+        return np.array([lo, hi], float), np.array([_mixture_cell(w, m, s, lo, hi)[1]])
+    mu = float(w @ m)
+    var = max(float(w @ (s ** 2 + m ** 2) - mu * mu), _VAR_FLOOR)
+    sd = math.sqrt(var)
+    Plo = float(_Phi(np.array((lo - mu) / sd)))
+    Phi_hi = float(_Phi(np.array((hi - mu) / sd)))
+    qs = np.clip(np.linspace(Plo, Phi_hi, num_pts + 1), 1e-15, 1 - 1e-15)
+    e = mu + sd * ndtri(qs); e[0], e[-1] = lo, hi             # init: moment-matched-Gaussian quantiles
+    for _ in range(iters):
+        v = np.array([_mixture_cell(w, m, s, e[i], e[i + 1])[1] for i in range(num_pts)])
+        ne = e.copy(); ne[1:-1] = 0.5 * (v[:-1] + v[1:])      # edges <- midpoints of mixture centroids
+        if np.max(np.abs(ne[1:-1] - e[1:-1])) < tol:
+            e = ne
+            break
+        e = ne
+    v = np.array([_mixture_cell(w, m, s, e[i], e[i + 1])[1] for i in range(num_pts)])
+    return e, v
+
+
+def lloyd_max_edges_mixture(weights, means, stds, num_bins, *, rectified: bool = False,
+                            iters: int = 1000) -> Tuple[np.ndarray, np.ndarray]:
+    """W2-optimal bin ``(edges, reps)`` for the EXACT Gaussian-mixture spike law (no quadrature).
+
+    ``weights, means, stds`` describe the layer's expected continuous law of ``A`` as the mixture
+    ``sum_k w_k N(means_k, stds_k^2)`` -- e.g. one component per current bin
+    (``w=p``, ``means=gamma*v + r.mu``, ``stds=sqrt(r.Sigma r)`` for the pre-activation). Returns the
+    Lloyd-Max ``(edges, representatives)`` where each representative is the closed-form mixture
+    centroid (``_mixture_cell``) and the interior edges are midpoints. ``rectified=True`` quantizes
+    ``max(mixture,0)`` (post-ReLU): one representative pinned at the 0-atom, the rest Lloyd-Max on the
+    positive part. Unlike ``lloyd_max_edges`` (which uses a single moment-matched Gaussian) this is
+    exact for the true mixture."""
+    w = np.asarray(weights, float); m = np.asarray(means, float)
+    s = np.maximum(np.asarray(stds, float), math.sqrt(_VAR_FLOOR))
+    w = w / w.sum()
+    if not rectified:
+        return _lloyd_max_mixture_interval(w, m, s, -np.inf, np.inf, num_bins, iters=iters)
+    if num_bins == 1:
+        return np.array([0.0, np.inf]), np.array([max(float(w @ m), 0.0)])
+    _e, v_pos = _lloyd_max_mixture_interval(w, m, s, 0.0, np.inf, num_bins - 1, iters=iters)
+    reps = np.empty(num_bins); reps[0] = 0.0; reps[1:] = np.maximum(v_pos, 0.0)
+    edges = np.empty(num_bins + 1); edges[0] = 0.0
+    edges[1:-1] = 0.5 * (reps[:-1] + reps[1:]); edges[-1] = np.inf
+    return np.maximum.accumulate(edges), reps
+
+
 # --------------------------------------------------------------------------- #
 # state
 # --------------------------------------------------------------------------- #
@@ -375,6 +502,7 @@ def _bulk_relu_update(mu: np.ndarray, Sigma: np.ndarray, method: str
 # --------------------------------------------------------------------------- #
 def linear_step_k2(state: BinnedK2State, M: np.ndarray, edges: np.ndarray, *,
                    min_prob: float = _DEFAULT_MIN_PROB, psd_clip: bool = True,
+                   workers: Workers = None,
                    stats: Optional[dict] = None) -> BinnedK2State:
     """Propagate a binned K=2 state through the linear map ``M`` (= W + e e^T).
 
@@ -384,6 +512,10 @@ def linear_step_k2(state: BinnedK2State, M: np.ndarray, edges: np.ndarray, *,
     never allocates the ``(m, m, d, d)`` tensor from the spec pseudocode -- the
     per-old-bin covariance ``Sigma_C - g g^T / s_Y^2`` is beta-independent, so only the
     rank-1 ``g g^T`` piece is reweighted per new bin.
+
+    ``workers``: thread count for the two independent per-bin loops (over old bins, then
+    new bins). ``None``/``"auto"`` auto-resolves per machine (``resolve_workers``); pass
+    ``1`` for serial. Results are identical to serial regardless of the count.
     """
     p, avals, mu, Sigma = state.p, state.a, state.mu, state.Sigma
     m_old = p.shape[0]
@@ -408,9 +540,9 @@ def linear_step_k2(state: BinnedK2State, M: np.ndarray, edges: np.ndarray, *,
     Sig0 = np.zeros((m_old, d, d))      # Sigma_C - g g^T / s_Y^2  (beta-independent)
     sY2 = np.zeros(m_old)
 
-    for alpha in range(m_old):
+    def _old_bin(alpha):
         if p[alpha] <= 0:
-            continue
+            return
         v = float(avals[alpha])
         mu_a = mu[alpha]
         Sig_a = Sigma[alpha]
@@ -427,7 +559,7 @@ def linear_step_k2(state: BinnedK2State, M: np.ndarray, edges: np.ndarray, *,
             Q[beta, alpha] = 1.0
             ybar[beta, alpha] = mY
             Sig0[alpha] = symmetrize(SigC)           # g ~ 0 here, so Sig0 = SigC
-            continue
+            return
 
         ag[alpha] = g[alpha] / sY2[alpha]
         Sig0[alpha] = symmetrize(SigC - np.outer(g[alpha], g[alpha]) / sY2[alpha])
@@ -439,16 +571,19 @@ def linear_step_k2(state: BinnedK2State, M: np.ndarray, edges: np.ndarray, *,
         tau1[:, alpha] = np.where(keep, t1, 0.0)
         yvar[:, alpha] = np.where(keep, y_var, 0.0)
 
+    _run_bins(m_old, _old_bin, workers)
+
     p_new_raw = Q @ p                                # (m_new,)
     a_new = np.zeros(m_new)
     mu_new = np.zeros((m_new, d))
     Sig_new = np.zeros((m_new, d, d))
-    psd_clipped = 0.0
 
-    for beta in range(m_new):
+    def _new_bin(beta):
+        """Returns the PSD-clipped eigen-mass for this bin (summed by the caller -- a
+        shared ``+=`` accumulator would race under threads)."""
         if p_new_raw[beta] <= min_prob:
             a_new[beta] = safe_bin_representative(edges, beta)
-            continue
+            return 0.0
         eta = p * Q[beta, :] / p_new_raw[beta]       # posterior weights (m_old,)
         active = np.nonzero(eta > 0)[0]
         a_new[beta] = float(np.sum(eta[active] * ybar[beta, active]))
@@ -466,10 +601,14 @@ def linear_step_k2(state: BinnedK2State, M: np.ndarray, edges: np.ndarray, *,
             delta = mu_ab[j] - mu_new[beta]
             S += eta[alpha] * (Sig_ab + np.outer(delta, delta))
         S = symmetrize(S)
-        if psd_clip:
-            S, c = project_to_psd(S)
-            psd_clipped += c
+        if not psd_clip:
+            Sig_new[beta] = S
+            return 0.0
+        S, c = project_to_psd(S)
         Sig_new[beta] = S
+        return c
+
+    psd_clipped = float(sum(_run_bins(m_new, _new_bin, workers)))
 
     total = p_new_raw.sum()
     mass_lost = float(max(0.0, 1.0 - total))
@@ -488,6 +627,7 @@ def linear_step_k2(state: BinnedK2State, M: np.ndarray, edges: np.ndarray, *,
 # --------------------------------------------------------------------------- #
 def relu_step_k2(state: BinnedK2State, post_edges: np.ndarray, *,
                  min_prob: float = _DEFAULT_MIN_PROB, bulk_relu: str = "exact",
+                 workers: Workers = None,
                  stats: Optional[dict] = None) -> BinnedK2State:
     """Propagate a binned K=2 state through coordinatewise ReLU.
 
@@ -495,6 +635,10 @@ def relu_step_k2(state: BinnedK2State, post_edges: np.ndarray, *,
     backend). Spike: map each representative ``v -> max(v, 0)``, assign to ``post_edges``
     (nonnegative grid with a zero bin), and MERGE old bins landing in the same new bin
     by mixture moments (spec 8.3 / 9).
+
+    ``workers``: thread count for the independent per-bin loops (the per-old-bin bulk ReLU
+    -- the dominant cost -- and the per-new-bin merge). ``None``/``"auto"`` auto-resolves
+    per machine (``resolve_workers``); pass ``1`` for serial. Results match serial exactly.
     """
     p, avals, mu, Sigma = state.p, state.a, state.mu, state.Sigma
     m_old = p.shape[0]
@@ -505,10 +649,12 @@ def relu_step_k2(state: BinnedK2State, post_edges: np.ndarray, *,
     # 1) bulk ReLU inside each old bin
     a_bulk = np.zeros((m_old, d))
     Sig_bulk = np.zeros((m_old, d, d))
-    for alpha in range(m_old):
-        if p[alpha] <= 0:
-            continue
-        a_bulk[alpha], Sig_bulk[alpha] = _bulk_relu_update(mu[alpha], Sigma[alpha], bulk_relu)
+
+    def _bulk_bin(alpha):
+        if p[alpha] > 0:
+            a_bulk[alpha], Sig_bulk[alpha] = _bulk_relu_update(mu[alpha], Sigma[alpha], bulk_relu)
+
+    _run_bins(m_old, _bulk_bin, workers)
 
     # 2) map spike representatives through ReLU and merge bins
     old_to_new = [find_bin(post_edges, max(float(avals[alpha]), 0.0)) for alpha in range(m_old)]
@@ -520,10 +666,11 @@ def relu_step_k2(state: BinnedK2State, post_edges: np.ndarray, *,
     a_new = np.zeros(m_post)
     mu_new = np.zeros((m_post, d))
     Sig_new = np.zeros((m_post, d, d))
-    for beta in range(m_post):
+
+    def _post_bin(beta):
         if p_new_raw[beta] <= min_prob:
             a_new[beta] = safe_bin_representative(post_edges, beta)
-            continue
+            return
         alphas = [a for a in range(m_old) if old_to_new[a] == beta and p[a] > 0]
         eta = np.array([p[a] / p_new_raw[beta] for a in alphas])
         a_new[beta] = float(sum(e * max(float(avals[a]), 0.0) for e, a in zip(eta, alphas)))
@@ -534,6 +681,8 @@ def relu_step_k2(state: BinnedK2State, post_edges: np.ndarray, *,
             delta = a_bulk[a] - mu_new[beta]
             S += e * (Sig_bulk[a] + np.outer(delta, delta))
         Sig_new[beta] = symmetrize(S)
+
+    _run_bins(m_post, _post_bin, workers)
 
     total = p_new_raw.sum()
     mass_lost = float(max(0.0, 1.0 - total))
@@ -591,13 +740,25 @@ def unconditional_mean_cov(state: BinnedK2State) -> Tuple[np.ndarray, np.ndarray
 # --------------------------------------------------------------------------- #
 # full forward  (spec section 13)
 # --------------------------------------------------------------------------- #
+def _spike_mixture(state: BinnedK2State, M: np.ndarray
+                   ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The pre-activation spike law ``A^+ = gamma A + r.B`` as a Gaussian mixture over the current
+    bins: component ``alpha`` is ``N(m_Y,alpha, s_Y,alpha^2)`` with weight ``p_alpha`` (the
+    linear-step algebra). Returns ``(weights, means, stds)`` for ``lloyd_max_edges_mixture``."""
+    gamma = float(M[0, 0]); r = np.asarray(M[0, 1:], dtype=np.float64)
+    m_Y = gamma * state.a + state.mu @ r
+    s_Y = np.sqrt(np.clip((state.Sigma @ r * r).sum(axis=1), _VAR_FLOOR, None))
+    return state.p, m_Y, s_Y
+
+
 def run_binned_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
-                        input_dim: int, num_bins: int, *,
+                        input_dim: int, num_bins: int, *, grid: str = "fixed",
                         pre_edges: Optional[np.ndarray] = None,
                         post_edges: Optional[np.ndarray] = None,
                         num_bins_post: Optional[int] = None,
                         input_std: float = 1.0, bulk_relu: str = "exact",
                         min_prob: float = _DEFAULT_MIN_PROB,
+                        workers: Workers = None,
                         collect: bool = False) -> dict:
     """Predict ``E[f(X)]`` for ``X ~ N(0, input_std^2 I)`` by COORDINATE-SPIKE BINNED
     kprop (K=2) along ``e = e_1``.
@@ -606,28 +767,51 @@ def run_binned_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
     hidden matrices ``M = W + e e^T`` (the spike is assumed already baked in -- pass the
     actual matrices), each followed by ReLU, then the linear readout (no ReLU).
     ``num_bins`` is THE hyperparameter: the number of spike bins. ``num_bins_post``
-    (default = ``num_bins``) sizes the post-ReLU grid. Default grids are equal-mass
-    Gaussian quantiles (``pre_edges`` includes negative bins; ``post_edges`` is
-    nonnegative). Returns ``{"mean", "metadata", ...}``; with ``collect`` also the
-    per-layer spike distribution and the final state.
+    (default = ``num_bins``) sizes the post-ReLU grid.
+
+    ``grid`` selects the bin placement:
+      ``"fixed"`` (default) -- equal-mass Gaussian quantiles, built once and reused every layer
+        (``pre_edges`` includes negative bins; ``post_edges`` is nonnegative + a zero bin).
+      ``"wasserstein"`` -- per-layer DYNAMIC Lloyd-Max bins minimizing the Wasserstein-2 distance to
+        the layer's expected continuous spike law: the pre-activation grid Lloyd-Max-quantizes the
+        EXACT Gaussian mixture ``A^+ = sum_a p_a N(m_Y,a, s_Y,a^2)`` over ALL the reals, and the
+        post-ReLU grid quantizes the rectified mixture (0-atom pinned). ``pre_edges``/``post_edges``
+        are ignored in this mode.
+
+    ``workers`` sets the per-bin thread count inside each linear/ReLU step. ``None``/``"auto"``
+    (the default) auto-resolves per machine -- ``8`` on a CUDA box, else ``min(8, cpu_count)``,
+    overridable via ``$BINNED_KPROP_WORKERS`` -- so the default is PARALLEL; pass ``workers=1``
+    for serial. Results are identical to serial regardless of the thread count. The resolved
+    count is echoed in ``metadata["workers"]``. (If a threaded numpy build (MKL/OpenBLAS) is in
+    use, cap its inner threads, e.g. ``OMP_NUM_THREADS``, to avoid oversubscription.)
+
+    Returns ``{"mean", "metadata", ...}``; with ``collect`` also the per-layer spike distribution
+    and the final state.
     """
     if num_bins < 1:
         raise ValueError("num_bins must be >= 1")
+    if grid not in ("fixed", "wasserstein"):
+        raise ValueError(f"grid must be 'fixed' or 'wasserstein', got {grid!r}")
     n_hidden = len(weights) - 1
     if n_hidden < 1:
         raise ValueError("need at least one hidden layer + a readout")
     d = input_dim - 1
     if num_bins_post is None:
         num_bins_post = num_bins
-    if pre_edges is None:
-        pre_edges = make_gaussian_edges(num_bins, std=input_std)
-    if post_edges is None:
-        post_edges = make_relu_post_edges(num_bins_post, std=input_std)
-    pre_edges = np.asarray(pre_edges, dtype=np.float64)
-    post_edges = np.asarray(post_edges, dtype=np.float64)
+    dynamic = grid == "wasserstein"
+    if dynamic:
+        init_edges, _ = lloyd_max_edges(0.0, input_std, num_bins)   # W2-optimal N(0,std) over all reals
+    else:
+        if pre_edges is None:
+            pre_edges = make_gaussian_edges(num_bins, std=input_std)
+        if post_edges is None:
+            post_edges = make_relu_post_edges(num_bins_post, std=input_std)
+        pre_edges = np.asarray(pre_edges, dtype=np.float64)
+        post_edges = np.asarray(post_edges, dtype=np.float64)
+        init_edges = pre_edges
 
     stats: dict = {}
-    state = gaussian_initial_state(d, pre_edges, input_std=input_std)
+    state = gaussian_initial_state(d, init_edges, input_std=input_std)
     spike_by_layer = []
     for li in range(n_hidden):
         W, _b = weights[li]
@@ -635,8 +819,15 @@ def run_binned_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
         if M.shape != (input_dim, input_dim):
             raise ValueError(f"hidden layer {li} must be square ({input_dim},{input_dim}); "
                              f"got {M.shape}")
-        state = linear_step_k2(state, M, pre_edges, min_prob=min_prob, stats=stats)
-        state = relu_step_k2(state, post_edges, min_prob=min_prob, bulk_relu=bulk_relu, stats=stats)
+        if dynamic:                                  # re-grid to the W2-optimal Lloyd-Max bins
+            p_mix, m_Y, s_Y = _spike_mixture(state, M)
+            layer_pre, _ = lloyd_max_edges_mixture(p_mix, m_Y, s_Y, num_bins)
+            layer_post, _ = lloyd_max_edges_mixture(p_mix, m_Y, s_Y, num_bins_post, rectified=True)
+        else:
+            layer_pre, layer_post = pre_edges, post_edges
+        state = linear_step_k2(state, M, layer_pre, min_prob=min_prob, workers=workers, stats=stats)
+        state = relu_step_k2(state, layer_post, min_prob=min_prob, bulk_relu=bulk_relu,
+                             workers=workers, stats=stats)
         if collect:
             spike_by_layer.append(dict(layer=li, p=state.p.copy(), a=state.a.copy()))
 
@@ -648,8 +839,9 @@ def run_binned_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
     out = {
         "mean": np.asarray(mean, dtype=np.float64).reshape(-1),
         "metadata": {
-            "predictor": "binned_kprop_k2", "K": 2, "num_bins": int(num_bins),
+            "predictor": "binned_kprop_k2", "K": 2, "num_bins": int(num_bins), "grid": grid,
             "num_bins_post": int(num_bins_post), "n_hidden": n_hidden,
+            "workers": resolve_workers(workers),
             "input_dim": int(input_dim), "bulk_relu": bulk_relu,
             "output_dim": int(np.asarray(mean).reshape(-1).shape[0]),
             "max_linear_mass_lost": float(max(stats.get("linear_mass_lost", [0.0]))),

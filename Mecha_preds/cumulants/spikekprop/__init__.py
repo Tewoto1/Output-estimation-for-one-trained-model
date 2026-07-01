@@ -14,7 +14,7 @@ survive for a LOCALIZED spike (``v = e1``: ``sum_i |v_i|^r = 1``) and vanish for
     pred4 = run_spike_kprop(model, spike_dir="e1", config={"R": 4})["mean"] # + d3,d4 along v
 
 ``spike_dir`` is ``"e1"``, ``"ones"``, or a vector. Setting ``spike_dir="ones"`` reproduces
-SW-KPROP. ReLU numerics reuse the canonical ``..relu_integrals`` (validated). Needs Python >= 3.12 or the
+SW-KPROP. ReLU numerics reuse the canonical ``Mecha_preds._utils`` (validated). Needs Python >= 3.12 or the
 kprop-compat shim only transitively (the spikekprop core itself is torch-free numpy/scipy).
 """
 from .core import (

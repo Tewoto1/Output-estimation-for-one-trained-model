@@ -1,31 +1,36 @@
-"""relu_integrals.py -- THE canonical Gaussian-ReLU integrals (numpy + scipy, torch-free).
+"""_utils.py -- shared torch-free numerical kernel for the Mecha_preds predictors.
 
-Single source of truth for the closed-form rectified-Gaussian moments used by every
-torch-free predictor in this package (``swkprop``, ``spikekprop``, ``exact_meanprop``,
-``..binned_kprop``). Two closed forms (paper eqs 22-24):
+Single source of truth (numpy + scipy, NO torch) for the two families of helpers every
+torch-free predictor in this package reuses -- the binned K=2 core (``..binned_kprop``)
+and the cumulant predictors (``swkprop``, ``spikekprop``, ``exact_meanprop``):
 
-    rank 1 (one neuron, ``Y ~ N(mu, var)``):                         -- ``relu_moments_1d``
-        E[ReLU(Y)]   = mu*Phi(a) + sigma*phi(a)              a = mu/sigma
-        E[ReLU(Y)^2] = (mu^2 + var)*Phi(a) + mu*sigma*phi(a)
+  * Gaussian-ReLU integrals -- the closed-form rectified-Gaussian moments (paper eqs 22-24):
+        rank 1 (``Y ~ N(mu, var)``):                                  -- ``relu_moments_1d``
+            E[ReLU(Y)]   = mu*Phi(a) + sigma*phi(a)              a = mu/sigma
+            E[ReLU(Y)^2] = (mu^2 + var)*Phi(a) + mu*sigma*phi(a)
+        rank 2 (a pair ``(Z_i, Z_j) ~ N(mu, Sigma)``):               -- ``exact_relu_covariance``
+            E[ReLU(Z_i) ReLU(Z_j)]  via the exact bivariate-normal moments
+            (Owen's T for Phi_2), then Cov = E[..] - E[ReLU_i]E[ReLU_j].
 
-    rank 2 (a pair ``(Z_i, Z_j) ~ N(mu, Sigma)``):                   -- ``exact_relu_covariance``
-        E[ReLU(Z_i) ReLU(Z_j)]  via the exact bivariate-normal moments
-        (Owen's T for Phi_2), then Cov = E[..] - E[ReLU_i]E[ReLU_j].
+  * Classic matrix utilities -- ``symmetrize`` and ``project_to_psd`` (eigenvalue clip).
 
-Relationship to the vendored kprop. These are the SAME formulas as the numpy core of
-``kprop/exact_relu_covariance.py`` (``relu_moments_1d_np`` / ``exact_relu_covariance_np``,
-validated to ~1e-15 vs quadrature + 20M-sample MC). That vendored module is kept as its own
-copy ON PURPOSE: it is third-party/pinned and it ``import torch`` at module load (it ships the
-torch wrappers + the ``exact_relu_covariance_kprop`` HTower bridge used by the harmonic-kprop
-path). Importing it would therefore pull torch into the otherwise torch-free predictor cores,
-so this module is the deliberate torch-free twin -- the one allowed duplication, across the
-torch / no-torch boundary. Everything torch-free imports the integrals from HERE.
+This module lives at the TOP of ``Mecha_preds`` (not inside one predictor sub-package, and not
+inside ``cumulants`` whose ``__init__`` eagerly imports torch) precisely so the torch-free cores
+can import it with only numpy + scipy installed -- ``Mecha_preds/__init__.py`` is torch-free, so
+``from Mecha_preds._utils import ...`` pulls in no torch. That removes the need for the old
+per-package import shims (``binned_kprop/_relu.py`` and ``swkprop/relu.py``).
 
-``swkprop/relu.py`` re-exports this module for backward compatibility.
+Relationship to the vendored kprop. The ReLU integrals are the SAME formulas as the numpy core
+of ``cumulants/kprop/exact_relu_covariance.py`` (``relu_moments_1d_np`` / ``exact_relu_covariance_np``,
+validated to ~1e-15 vs quadrature + 20M-sample MC). That vendored module is kept as its own copy ON
+PURPOSE: it is third-party/pinned and ``import torch`` at module load (it ships the torch wrappers +
+the HTower bridge for the harmonic-kprop path). This module is the deliberate torch-free twin -- the
+one allowed duplication, across the torch / no-torch boundary. Everything torch-free imports from HERE.
 """
 from __future__ import annotations
 
 import math
+from typing import Tuple
 
 import numpy as np
 
@@ -40,6 +45,9 @@ _SQRT_2PI = math.sqrt(2.0 * math.pi)
 _INV_2PI = 1.0 / (2.0 * math.pi)
 
 
+# --------------------------------------------------------------------------- #
+# Gaussian-ReLU integrals
+# --------------------------------------------------------------------------- #
 def _phi(x: np.ndarray) -> np.ndarray:
     return np.exp(-0.5 * x * x) / _SQRT_2PI
 
@@ -196,3 +204,35 @@ def exact_relu_covariance(mu, Sigma, *, var_eps: float = _DEFAULT_VAR_EPS, neg_r
     new_Sigma = 0.5 * (new_Sigma + new_Sigma.T)
     np.fill_diagonal(new_Sigma, diag_var)
     return new_mu, new_Sigma
+
+
+# --------------------------------------------------------------------------- #
+# classic matrix utilities (symmetrize / PSD projection by eigenvalue clip)
+# --------------------------------------------------------------------------- #
+def symmetrize(A: np.ndarray) -> np.ndarray:
+    """Symmetric part ``0.5 (A + A^T)`` -- kills the antisymmetric roundoff in a covariance."""
+    return 0.5 * (A + A.T)
+
+
+def project_to_psd(A: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Clip negative eigenvalues to 0. Returns ``(A_psd, clipped_mass)`` where
+    ``clipped_mass`` is the total magnitude of the removed negative eigenvalues
+    (0 if already PSD) -- log it; it should be numerical roundoff only."""
+    A = symmetrize(A)
+    vals, vecs = np.linalg.eigh(A)
+    vmin = float(vals.min()) if vals.size else 0.0
+    if vmin >= 0.0:
+        return A, 0.0
+    clipped = float(-vals[vals < 0.0].sum())
+    A = (vecs * np.clip(vals, 0.0, None)) @ vecs.T
+    return symmetrize(A), clipped
+
+
+__all__ = [
+    # Gaussian-ReLU integrals
+    "_phi", "_Phi", "_bvn_pdf", "bvn_cdf", "relu_moments_1d",
+    "_relu_cross_moment_perfect_corr", "exact_relu_covariance",
+    "_DEFAULT_VAR_EPS", "_NEG_RTOL", "_RHO_TOL", "_RHO_VALID_TOL",
+    # matrix utilities
+    "symmetrize", "project_to_psd",
+]

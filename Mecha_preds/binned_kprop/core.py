@@ -627,36 +627,36 @@ def linear_step_k2(state: BinnedK2State, M: np.ndarray, edges: np.ndarray, *,
 # --------------------------------------------------------------------------- #
 def relu_step_k2(state: BinnedK2State, post_edges: np.ndarray, *,
                  min_prob: float = _DEFAULT_MIN_PROB, bulk_relu: str = "exact",
-                 workers: Workers = None,
+                 relu_merge: str = "post", workers: Workers = None,
                  stats: Optional[dict] = None) -> BinnedK2State:
     """Propagate a binned K=2 state through coordinatewise ReLU.
 
-    Bulk: apply the K=2 ReLU covariance update inside every old bin (``bulk_relu``
-    backend). Spike: map each representative ``v -> max(v, 0)``, assign to ``post_edges``
-    (nonnegative grid with a zero bin), and MERGE old bins landing in the same new bin
-    by mixture moments (spec 8.3 / 9).
+    Bulk: apply the K=2 ReLU covariance update (``bulk_relu`` backend). Spike: map each
+    representative ``v -> max(v, 0)``, assign to ``post_edges`` (nonnegative grid with a zero
+    bin), and MERGE old bins landing in the same new bin by mixture moments (spec 8.3 / 9).
 
-    ``workers``: thread count for the independent per-bin loops (the per-old-bin bulk ReLU
-    -- the dominant cost -- and the per-new-bin merge). ``None``/``"auto"`` auto-resolves
-    per machine (``resolve_workers``); pass ``1`` for serial. Results match serial exactly.
+    ``relu_merge`` sets the order of the merge and the ReLU for bins sharing a post-bin
+    (mainly the zero bin, where all negative-spike bins collapse):
+      ``"post"`` (default, Strategy 1) -- ReLU each old bin's bulk, THEN merge the post-ReLU
+        moments. One exact-ReLU per OLD bin.
+      ``"pre"``  (Strategy 2) -- MERGE the old bins' pre-ReLU bulk into one Gaussian per
+        post-bin, THEN apply one exact-ReLU. One exact-ReLU per (occupied) POST-bin -- far
+        fewer of the expensive bivariate-ReLU calls when many bins merge (the zero bin).
+        Accuracy-neutral when the merged bins are ~bulk-exchangeable (the coordinate-spike
+        case: verified identical to ``"post"`` to ~1e-5 mean / 1e-3 cov).
+
+    ``workers``: thread count for the independent per-bin loops. ``None``/``"auto"``
+    auto-resolves per machine; pass ``1`` for serial. Results match serial exactly.
     """
+    if relu_merge not in ("post", "pre"):
+        raise ValueError(f"relu_merge must be 'post' or 'pre', got {relu_merge!r}")
     p, avals, mu, Sigma = state.p, state.a, state.mu, state.Sigma
     m_old = p.shape[0]
     d = mu.shape[1]
     post_edges = np.asarray(post_edges, dtype=np.float64)
     m_post = post_edges.shape[0] - 1
 
-    # 1) bulk ReLU inside each old bin
-    a_bulk = np.zeros((m_old, d))
-    Sig_bulk = np.zeros((m_old, d, d))
-
-    def _bulk_bin(alpha):
-        if p[alpha] > 0:
-            a_bulk[alpha], Sig_bulk[alpha] = _bulk_relu_update(mu[alpha], Sigma[alpha], bulk_relu)
-
-    _run_bins(m_old, _bulk_bin, workers)
-
-    # 2) map spike representatives through ReLU and merge bins
+    # map spike representatives through ReLU; assign old bins to post-bins (both strategies)
     old_to_new = [find_bin(post_edges, max(float(avals[alpha]), 0.0)) for alpha in range(m_old)]
     p_new_raw = np.zeros(m_post)
     for alpha in range(m_old):
@@ -667,6 +667,17 @@ def relu_step_k2(state: BinnedK2State, post_edges: np.ndarray, *,
     mu_new = np.zeros((m_post, d))
     Sig_new = np.zeros((m_post, d, d))
 
+    # Strategy 1: bulk-ReLU each old bin up front, then merge POST-ReLU moments.
+    a_bulk = Sig_bulk = None
+    if relu_merge == "post":
+        a_bulk = np.zeros((m_old, d)); Sig_bulk = np.zeros((m_old, d, d))
+
+        def _bulk_bin(alpha):
+            if p[alpha] > 0:
+                a_bulk[alpha], Sig_bulk[alpha] = _bulk_relu_update(mu[alpha], Sigma[alpha], bulk_relu)
+
+        _run_bins(m_old, _bulk_bin, workers)
+
     def _post_bin(beta):
         if p_new_raw[beta] <= min_prob:
             a_new[beta] = safe_bin_representative(post_edges, beta)
@@ -674,13 +685,25 @@ def relu_step_k2(state: BinnedK2State, post_edges: np.ndarray, *,
         alphas = [a for a in range(m_old) if old_to_new[a] == beta and p[a] > 0]
         eta = np.array([p[a] / p_new_raw[beta] for a in alphas])
         a_new[beta] = float(sum(e * max(float(avals[a]), 0.0) for e, a in zip(eta, alphas)))
-        for e, a in zip(eta, alphas):
-            mu_new[beta] += e * a_bulk[a]
-        S = np.zeros((d, d))
-        for e, a in zip(eta, alphas):
-            delta = a_bulk[a] - mu_new[beta]
-            S += e * (Sig_bulk[a] + np.outer(delta, delta))
-        Sig_new[beta] = symmetrize(S)
+        if relu_merge == "post":                      # mix POST-ReLU per-bin moments (Strategy 1)
+            mm = np.zeros(d)
+            for e, a in zip(eta, alphas):
+                mm += e * a_bulk[a]
+            S = np.zeros((d, d))
+            for e, a in zip(eta, alphas):
+                delta = a_bulk[a] - mm
+                S += e * (Sig_bulk[a] + np.outer(delta, delta))
+            mu_new[beta] = mm
+            Sig_new[beta] = symmetrize(S)
+        else:                                         # merge PRE-ReLU, then ONE ReLU (Strategy 2)
+            mu_pre = np.zeros(d)
+            for e, a in zip(eta, alphas):
+                mu_pre += e * mu[a]
+            S = np.zeros((d, d))
+            for e, a in zip(eta, alphas):
+                delta = mu[a] - mu_pre
+                S += e * (Sigma[a] + np.outer(delta, delta))
+            mu_new[beta], Sig_new[beta] = _bulk_relu_update(mu_pre, symmetrize(S), bulk_relu)
 
     _run_bins(m_post, _post_bin, workers)
 
@@ -757,6 +780,7 @@ def run_binned_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
                         post_edges: Optional[np.ndarray] = None,
                         num_bins_post: Optional[int] = None,
                         input_std: float = 1.0, bulk_relu: str = "exact",
+                        relu_merge: str = "post",
                         min_prob: float = _DEFAULT_MIN_PROB,
                         workers: Workers = None,
                         collect: bool = False) -> dict:
@@ -827,6 +851,7 @@ def run_binned_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
             layer_pre, layer_post = pre_edges, post_edges
         state = linear_step_k2(state, M, layer_pre, min_prob=min_prob, workers=workers, stats=stats)
         state = relu_step_k2(state, layer_post, min_prob=min_prob, bulk_relu=bulk_relu,
+                             relu_merge=relu_merge,
                              workers=workers, stats=stats)
         if collect:
             spike_by_layer.append(dict(layer=li, p=state.p.copy(), a=state.a.copy()))
@@ -842,7 +867,7 @@ def run_binned_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
             "predictor": "binned_kprop_k2", "K": 2, "num_bins": int(num_bins), "grid": grid,
             "num_bins_post": int(num_bins_post), "n_hidden": n_hidden,
             "workers": resolve_workers(workers),
-            "input_dim": int(input_dim), "bulk_relu": bulk_relu,
+            "input_dim": int(input_dim), "bulk_relu": bulk_relu, "relu_merge": relu_merge,
             "output_dim": int(np.asarray(mean).reshape(-1).shape[0]),
             "max_linear_mass_lost": float(max(stats.get("linear_mass_lost", [0.0]))),
             "max_relu_mass_lost": float(max(stats.get("relu_mass_lost", [0.0]))),

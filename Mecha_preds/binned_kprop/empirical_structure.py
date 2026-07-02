@@ -117,15 +117,20 @@ class _Accum:
         self.sbb = np.zeros((num_bins, d, d), dtype=np.float64)
 
     def add(self, bin_idx: np.ndarray, spike: np.ndarray, bulk: np.ndarray) -> None:
-        for b in range(self.cnt.shape[0]):
-            m = bin_idx == b
-            if not np.any(m):
-                continue
-            Bp = bulk[m]
-            self.cnt[b] += Bp.shape[0]
-            self.ssp[b] += float(spike[m].sum())
-            self.sb[b] += Bp.sum(axis=0)
-            self.sbb[b] += Bp.T @ Bp
+        # sort once, then accumulate each bin from a CONTIGUOUS slice (one BLAS GEMM per bin) --
+        # avoids re-scanning the whole batch with a boolean mask num_bins times.
+        nb = self.cnt.shape[0]
+        order = np.argsort(bin_idx, kind="stable")
+        bs = bin_idx[order]; Bs = bulk[order]; sps = spike[order]
+        bounds = np.searchsorted(bs, np.arange(nb + 1))
+        for b in range(nb):
+            s, e = int(bounds[b]), int(bounds[b + 1])
+            if e > s:
+                seg = Bs[s:e]
+                self.cnt[b] += (e - s)
+                self.ssp[b] += float(sps[s:e].sum())
+                self.sb[b] += seg.sum(axis=0)
+                self.sbb[b] += seg.T @ seg
 
     def raw(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         return self.cnt, self.ssp, self.sb, self.sbb
@@ -242,15 +247,21 @@ def empirical_binned_states(Ws: Sequence[Tuple[np.ndarray, Optional[np.ndarray]]
 
 def _empirical_binned_states_torch(Ws, n, *, num_bins, spike_coord, bulk_idx,
                                    n_samples, n_edge_samples, batch, seed):  # pragma: no cover
-    """torch backend (GPU-friendly): same computation as numpy, streamed on device, split-half."""
+    """torch backend (GPU). Two things matter for speed on a T4:
+      (1) fp32 compute -- the T4 runs fp64 GEMMs ~32x slower; we accumulate in fp64 for accuracy.
+      (2) per-bin covariance via ONE argsort + contiguous-segment GEMMs (shared by pre & post,
+          one CPU sync per layer-half) instead of a num_bins-way boolean-mask loop of tiny kernels.
+    Numerically matches the numpy path up to fp32 rounding + MC noise."""
+    import numpy as _np
     import torch
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dt = torch.float64 if dev.type == "cuda" else torch.float32
+    dt = torch.float32                                   # compute dtype (was float64: the T4 killer)
     L = len(Ws) - 1
     d = n - 1
     Wh = [torch.as_tensor(Ws[li][0], dtype=dt, device=dev) for li in range(L)]
     bulk_t = torch.as_tensor(bulk_idx, device=dev)
 
+    # ---- pass 1: equal-mass edges on the pre-activation spike coord, per hidden layer ----
     g = torch.Generator(device=dev).manual_seed(seed)
     cols = [[] for _ in range(L)]
     got = 0
@@ -267,14 +278,16 @@ def _empirical_binned_states_torch(Ws, n, *, num_bins, spike_coord, bulk_idx,
     for li in range(L):
         e = torch.cummax(torch.quantile(torch.cat(cols[li]), qs), 0).values
         e[0], e[-1] = float("-inf"), float("inf")
-        edges.append(e)
+        edges.append(e.contiguous())
 
+    # ---- fp64 accumulators, one dict per (rep, half) ----
     def new():
-        return dict(cnt=torch.zeros(num_bins, dtype=dt, device=dev),
-                    ssp=torch.zeros(num_bins, dtype=dt, device=dev),
-                    sb=torch.zeros(num_bins, d, dtype=dt, device=dev),
-                    sbb=torch.zeros(num_bins, d, d, dtype=dt, device=dev))
+        return dict(cnt=torch.zeros(num_bins, dtype=torch.float64, device=dev),
+                    ssp=torch.zeros(num_bins, dtype=torch.float64, device=dev),
+                    sb=torch.zeros(num_bins, d, dtype=torch.float64, device=dev),
+                    sbb=torch.zeros(num_bins, d, d, dtype=torch.float64, device=dev))
     accs = {(rep, hf): [new() for _ in range(L)] for rep in ("pre", "post") for hf in ("A", "B")}
+
     g = torch.Generator(device=dev).manual_seed(seed + 1)
     got = 0
     while got < n_samples:
@@ -284,27 +297,39 @@ def _empirical_binned_states_torch(Ws, n, *, num_bins, spike_coord, bulk_idx,
         for li in range(L):
             z = h @ Wh[li].T
             spike = z[:, spike_coord]
-            bi = torch.bucketize(spike, edges[li][1:-1])
+            bi = torch.clamp(torch.searchsorted(edges[li], spike.contiguous(), right=True) - 1,
+                             0, num_bins - 1)                      # same binning as the numpy path
             zr = torch.relu(z)
-            for rep, src in (("pre", z), ("post", zr)):
-                Bp = src[:, bulk_t]
-                for hf, msk in (("A", half), ("B", ~half)):
-                    acc = accs[(rep, hf)][li]
-                    bim, sm, Bm = bi[msk], spike[msk], Bp[msk]
-                    acc["cnt"].index_add_(0, bim, torch.ones_like(sm))
-                    acc["ssp"].index_add_(0, bim, sm)
-                    acc["sb"].index_add_(0, bim, Bm)
-                    for bb in range(num_bins):
-                        mm = bim == bb
-                        if mm.any():
-                            Bmm = Bm[mm]
-                            acc["sbb"][bb] += Bmm.T @ Bmm
+            Bpre = z.index_select(1, bulk_t)
+            Bpost = zr.index_select(1, bulk_t)
+            for hf, msk in (("A", half), ("B", ~half)):
+                idx = msk.nonzero(as_tuple=True)[0]               # rows of this half
+                bim = bi.index_select(0, idx)
+                order = torch.argsort(bim)
+                sidx = idx.index_select(0, order)                 # global rows, sorted by bin
+                counts = torch.bincount(bim, minlength=num_bins).cpu().numpy()   # 1 sync / layer-half
+                off = _np.concatenate([[0], counts.cumsum()]).astype(int)
+                Bpre_s = Bpre.index_select(0, sidx)
+                Bpost_s = Bpost.index_select(0, sidx)
+                sps_s = spike.index_select(0, sidx)
+                accP = accs[("pre", hf)][li]; accQ = accs[("post", hf)][li]
+                for bb in range(num_bins):
+                    s, e = int(off[bb]), int(off[bb + 1])
+                    if e <= s:
+                        continue
+                    cnt_be = float(e - s)
+                    ssp_be = sps_s[s:e].sum().double()
+                    segP, segQ = Bpre_s[s:e], Bpost_s[s:e]
+                    accP["cnt"][bb] += cnt_be; accP["ssp"][bb] += ssp_be
+                    accP["sb"][bb] += segP.sum(0).double(); accP["sbb"][bb] += (segP.t() @ segP).double()
+                    accQ["cnt"][bb] += cnt_be; accQ["ssp"][bb] += ssp_be
+                    accQ["sb"][bb] += segQ.sum(0).double(); accQ["sbb"][bb] += (segQ.t() @ segQ).double()
             h = zr
         got += b
 
     def to_np(acc):
-        return (acc["cnt"].double().cpu().numpy(), acc["ssp"].double().cpu().numpy(),
-                acc["sb"].double().cpu().numpy(), acc["sbb"].double().cpu().numpy())
+        return (acc["cnt"].cpu().numpy(), acc["ssp"].cpu().numpy(),
+                acc["sb"].cpu().numpy(), acc["sbb"].cpu().numpy())
 
     def fin_split(li, rep):
         rawA, rawB = to_np(accs[(rep, "A")][li]), to_np(accs[(rep, "B")][li])

@@ -43,7 +43,11 @@ code(r"""!pip install -q scipy""")
 code(BOOTSTRAP_CELL)
 
 # =============================================================================
-md(r"""## Config""")
+md(r"""## Config
+
+`MC_DEVICE` auto-selects the **T4 GPU** for the MC ground-truth when CUDA is present (the predictor
+itself is torch-free numpy and stays on CPU — it's a fraction of the cost). On GPU the network matmuls
+and the O(d²) per-bin covariance both run on-device, which is the whole ballgame for wide models.""")
 code(r"""
 import os, time
 import numpy as np
@@ -59,13 +63,22 @@ THETA      = 1.0
 OUT_DIM    = 8
 SEED       = 10
 GRID       = "wasserstein"                # "wasserstein" | "fixed"
+try:
+    import torch; _HAS_CUDA = bool(torch.cuda.is_available())
+except Exception:
+    torch = None; _HAS_CUDA = False
+MC_DEVICE  = "cuda" if _HAS_CUDA else "cpu"    # MC ground-truth runs on the T4 when available
 MC_SAMPLES = 2_000_000 if QUICK else 20_000_000
-MC_BATCH   = 200_000
+MC_ELEMS   = 2.0e8 if MC_DEVICE == "cuda" else 4.0e7   # width-aware batch (~constant memory: batch*n)
+MC_WORKERS = 1 if MC_DEVICE == "cuda" else max(1, os.cpu_count() or 1)  # CPU path: parallel sample shards
+def mc_batch(n): return int(min(MC_SAMPLES, 8_000_000, max(100_000, MC_ELEMS // n)))  # fewer batches at small n
 MIN_COUNT  = 2000                         # skip a bin's error if it has fewer MC samples (too noisy)
 PLOT_STEP  = 2 * DEPTH - 1                # which step's per-bin curve to plot (default: last relu)
 CKPT_DIR   = "checkpoints/binned_kprop/perbin"; os.makedirs(CKPT_DIR, exist_ok=True)
 STEP_LABELS = [f"{k}{l}" for l in range(DEPTH) for k in ("lin", "relu")]
 print(f"QUICK={QUICK} widths={WIDTHS} depth={DEPTH} num_bins={NUMBINS} grid={GRID} MC={MC_SAMPLES:,}")
+print(f"MC device: {MC_DEVICE}" + (f" ({torch.cuda.get_device_name(0)})" if MC_DEVICE=='cuda' else f"  [numpy CPU x{MC_WORKERS} workers]"))
+print(f"width-aware MC batch: n={min(WIDTHS)}-> {mc_batch(min(WIDTHS)):,},  n={max(WIDTHS)}-> {mc_batch(max(WIDTHS)):,}")
 print(f"steps: {STEP_LABELS}   (plotting per-bin curve for step {STEP_LABELS[PLOT_STEP]})")
 """)
 
@@ -95,16 +108,19 @@ def capture(Ws, n):
         st = relu_step_k2(st, post);      caps.append(("relu", post, st.p.copy(), st.a.copy(), st.mu.copy(), st.Sigma.copy()))
     return caps
 
-# MC empirical conditional (mean, cov, count) of the bulk PER BIN, per step, streamed.
-def mc_perbin(Ws, n, caps, S, B, seed):
-    L = len(Ws) - 1; edges = [caps[i][1] for i in range(2 * L)]; m = [len(e) - 1 for e in edges]; d = n - 1
+# MC empirical conditional (mean, cov, count) of the bulk PER BIN, per step, streamed (numpy/CPU).
+# Split into a picklable SHARD (one process's chunk of samples -> raw sums) + finalize, so the CPU path
+# can run shards in parallel across cores (multiprocessing) and just add the per-bin accumulators.
+def _mc_shard(args):
+    Ws, n, edges, S, B, seed = args
+    L = len(Ws) - 1; m = [len(e) - 1 for e in edges]; d = n - 1
     sm = [np.zeros((m[i], d)) for i in range(2 * L)]
     sq = [np.zeros((m[i], d, d)) for i in range(2 * L)]
     cnt = [np.zeros(m[i], dtype=np.int64) for i in range(2 * L)]
     def acc(i, spike, bulk):
         idx = np.clip(np.searchsorted(edges[i], spike, side="right") - 1, 0, m[i] - 1)
         for a in np.unique(idx):
-            msk = idx == a; Bm = bulk[msk]
+            Bm = bulk[idx == a]
             sm[i][a] += Bm.sum(0); sq[i][a] += Bm.T @ Bm; cnt[i][a] += Bm.shape[0]
     rng = np.random.default_rng(seed); c = 0
     while c < S:
@@ -115,14 +131,77 @@ def mc_perbin(Ws, n, caps, S, B, seed):
                 acc(2 * li, z[:, 0], z[:, 1:])
                 hz = np.maximum(z, 0.0); acc(2 * li + 1, hz[:, 0], hz[:, 1:]); h = hz
         c += b
+    return sm, sq, cnt
+
+def _mc_finalize(sm, sq, cnt, m, d):
     out = []
-    for i in range(2 * L):
+    for i in range(len(m)):
         means = np.zeros((m[i], d)); covs = np.zeros((m[i], d, d))
         for a in range(m[i]):
             if cnt[i][a] > 0:
                 mu = sm[i][a] / cnt[i][a]; means[a] = mu; covs[a] = sq[i][a] / cnt[i][a] - np.outer(mu, mu)
         out.append((means, covs, cnt[i]))
     return out
+
+def mc_perbin_np(Ws, n, caps, S, B, seed, workers=1):
+    L = len(Ws) - 1; edges = [caps[i][1] for i in range(2 * L)]; m = [len(e) - 1 for e in edges]; d = n - 1
+    if workers and workers > 1 and S >= 2 * workers:
+        import multiprocessing as mp
+        per = -(-S // workers)   # ceil-divide samples across workers; distinct seed per shard
+        args = [(Ws, n, edges, min(per, S - k * per), B, seed + 1000 * k)
+                for k in range(workers) if k * per < S]
+        with mp.Pool(len(args)) as pool:
+            parts = pool.map(_mc_shard, args)
+        sm = [sum(pt[0][i] for pt in parts) for i in range(2 * L)]
+        sq = [sum(pt[1][i] for pt in parts) for i in range(2 * L)]
+        cnt = [sum(pt[2][i] for pt in parts) for i in range(2 * L)]
+    else:
+        sm, sq, cnt = _mc_shard((Ws, n, edges, S, B, seed))
+    return _mc_finalize(sm, sq, cnt, m, d)
+
+# Same computation on the GPU (T4): network matmul + per-bin covariance accumulation, all on CUDA.
+# Mirrors the numpy version (mask + matmul per present bin); the tiny sync from masking is negligible
+# next to the O(d^2) matmuls -- unlike a one-hot form, this does only the essential flops (not m x more).
+# fp32 matmul (T4 is slow at fp64) with fp64 accumulators; fp32 error is far below the MC noise floor.
+def mc_perbin_torch(Ws, n, caps, S, B, seed, device="cuda"):
+    import torch
+    L = len(Ws) - 1; d = n - 1
+    m = [caps[i][1].shape[0] - 1 for i in range(2 * L)]
+    edges = [torch.as_tensor(caps[i][1], device=device, dtype=torch.float64) for i in range(2 * L)]
+    Wt = [torch.as_tensor(W, device=device, dtype=torch.float32) for (W, _b) in Ws]
+    sm = [torch.zeros((m[i], d), device=device, dtype=torch.float64) for i in range(2 * L)]
+    sq = [torch.zeros((m[i], d, d), device=device, dtype=torch.float64) for i in range(2 * L)]
+    cnt = [torch.zeros(m[i], device=device, dtype=torch.int64) for i in range(2 * L)]
+    gen = torch.Generator(device=device); gen.manual_seed(seed)
+    def acc(i, spike, bulk):
+        idx = torch.clamp(torch.searchsorted(edges[i], spike.double(), right=True) - 1, 0, m[i] - 1)
+        for a in torch.unique(idx).tolist():
+            Bm = bulk[idx == a]
+            sm[i][a] += Bm.sum(0).double(); sq[i][a] += (Bm.t() @ Bm).double(); cnt[i][a] += Bm.shape[0]
+    c = 0
+    while c < S:
+        b = min(B, S - c)
+        h = torch.randn((b, n), device=device, dtype=torch.float32, generator=gen)
+        for li, (W, _b) in enumerate(Ws):
+            z = h @ Wt[li].t()
+            if li < L:
+                acc(2 * li, z[:, 0], z[:, 1:])
+                hz = torch.clamp(z, min=0.0); acc(2 * li + 1, hz[:, 0], hz[:, 1:]); h = hz
+        c += b
+    out = []
+    for i in range(2 * L):
+        cn = cnt[i].clamp(min=1).double()
+        mu = sm[i] / cn[:, None]
+        cov = sq[i] / cn[:, None, None] - mu[:, :, None] * mu[:, None, :]
+        empty = (cnt[i] == 0)
+        mu = mu.clone(); mu[empty] = 0.0; cov = cov.clone(); cov[empty] = 0.0
+        out.append((mu.cpu().numpy(), cov.cpu().numpy(), cnt[i].cpu().numpy()))
+    return out
+
+def mc_perbin(Ws, n, caps, S, B, seed):
+    if MC_DEVICE == "cuda":
+        return mc_perbin_torch(Ws, n, caps, S, B, seed, device="cuda")
+    return mc_perbin_np(Ws, n, caps, S, B, seed, workers=MC_WORKERS)
 
 def rel(a, b): return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-30))
 def mean_scaled(pm, mm, cov):                 # mean error normalized by the bin's activation scale
@@ -142,8 +221,8 @@ for n in WIDTHS:
     if os.path.exists(key):
         mc = pickle.load(open(key, "rb"))
     else:
-        t0 = time.time(); mc = mc_perbin(Ws, n, caps, MC_SAMPLES, MC_BATCH, 10_000 + SEED)
-        pickle.dump(mc, open(key, "wb")); print(f"  n={n}: MC {time.time()-t0:.1f}s")
+        t0 = time.time(); mc = mc_perbin(Ws, n, caps, MC_SAMPLES, mc_batch(n), 10_000 + SEED)
+        pickle.dump(mc, open(key, "wb")); print(f"  n={n}: MC {time.time()-t0:.1f}s  (batch {mc_batch(n):,}, {MC_DEVICE})")
     steps_pb = []; steps_avg = []
     for i in range(len(caps)):
         _lbl, _edg, p, a, mu, Sig = caps[i]; mmc, cmc, cnt = mc[i]; mm = len(p)

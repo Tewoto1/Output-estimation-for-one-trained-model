@@ -90,9 +90,12 @@ THETA    = 1.0                                    # plain e1 e1^T spike
 OUT_DIM  = 8
 SEED     = 1                                      # weight seed (the random matrix)
 MC_SEED  = 7
-N_SAMPLES = int(os.environ.get("STRUCT_SAMPLES", 400_000 if QUICK else 12_000_000))
+# 4M samples already gives ~N/(2*num_bins) ~ 95k samples per bin-half -- plenty for the split-half
+# debiased metrics (they are unbiased at any N). The torch backend runs fp32 (T4 fp64 is ~32x
+# slower) with fp64 accumulation; a bigger BATCH means fewer/larger GEMMs.
+N_SAMPLES = int(os.environ.get("STRUCT_SAMPLES", 400_000 if QUICK else 4_000_000))
 N_EDGE    = min(200_000, N_SAMPLES // 3)
-BATCH     = 100_000
+BATCH     = int(os.environ.get("STRUCT_BATCH", 50_000 if QUICK else 250_000))
 CKPT_DIR  = "checkpoints/binned_kprop/structure"; os.makedirs(CKPT_DIR, exist_ok=True)
 
 try:
@@ -100,7 +103,7 @@ try:
 except Exception:
     BACKEND = "numpy"
 print(f"QUICK={QUICK} widths={WIDTHS} depths={DEPTHS} bins={NUM_BINS} "
-      f"MC={N_SAMPLES:,} backend={BACKEND}")
+      f"MC={N_SAMPLES:,} batch={BATCH:,} backend={BACKEND}")
 """)
 
 # =============================================================================

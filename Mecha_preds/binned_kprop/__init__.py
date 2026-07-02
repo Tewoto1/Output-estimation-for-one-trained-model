@@ -21,27 +21,31 @@ ORDINARY harmonic kprop -- ``kprop_hook`` imports and calls
 ``Mecha_preds.cumulants.kprop`` for the per-bin bulk ReLU (``bulk_relu_kprop`` is also
 selectable as the K=2 bulk-ReLU backend via ``bulk_relu="kprop"``).
 
-The K=2 core (``core.py``) is numpy/scipy and torch-free; the ``kprop_hook`` /
-``adapter`` paths use torch.
+The K=2 core (``core.py``) is numpy/scipy and torch-free; the bin grids, truncated-normal
+stats, and W2-optimal quantizers live in ``binning.py`` (also torch-free); the
+``kprop_hook`` / ``adapter`` paths use torch.
 """
-from .core import (
-    BinnedK2State,
+from .binning import (
     normal_interval_stats,
     find_bin,
     safe_bin_representative,
-    symmetrize,
-    project_to_psd,
     make_gaussian_edges,
     make_relu_post_edges,
     lloyd_max_edges,
     lloyd_max_edges_mixture,
+    lloyd_max_edges_mixture_split,
+    resolve_workers,
+)
+from .core import (
+    BinnedK2State,
+    symmetrize,
+    project_to_psd,
     gaussian_initial_state,
     linear_step_k2,
     relu_step_k2,
     unconditional_mean,
     unconditional_mean_cov,
     run_binned_kprop_k2,
-    resolve_workers,
     SPIKE_COORD,
 )
 from .adapter import (
@@ -50,17 +54,30 @@ from .adapter import (
     config_summary,
     extract_mean,
 )
+from .empirical_structure import (
+    build_spiked_net,
+    empirical_binned_states,
+    mean_linearity,
+    cov_rank1_structure,
+    spike_coupling_column,
+    structure_report,
+    summarize_report,
+)
 
 __all__ = [
     # K=2 core
     "BinnedK2State", "normal_interval_stats", "find_bin", "safe_bin_representative",
     "symmetrize", "project_to_psd", "make_gaussian_edges", "make_relu_post_edges",
-    "lloyd_max_edges", "lloyd_max_edges_mixture", "gaussian_initial_state",
+    "lloyd_max_edges", "lloyd_max_edges_mixture", "lloyd_max_edges_mixture_split",
+    "gaussian_initial_state",
     "linear_step_k2", "relu_step_k2",
     "unconditional_mean", "unconditional_mean_cov", "run_binned_kprop_k2", "resolve_workers",
     "SPIKE_COORD",
     # MLP adapter
     "run_binned_kprop", "default_binned_kprop_config", "config_summary", "extract_mean",
+    # empirical structure test (the "binless" mean-linear + cov-rank-1 supposition)
+    "build_spiked_net", "empirical_binned_states", "mean_linearity", "cov_rank1_structure",
+    "spike_coupling_column", "structure_report", "summarize_report",
 ]
 
 # General K > 2 hooks into ordinary harmonic kprop live in ``.kprop_hook`` (torch):

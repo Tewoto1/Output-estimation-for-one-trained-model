@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import numpy as np
 
+from .binning import (
+    normal_interval_stats, make_gaussian_edges, make_relu_post_edges,
+)
 from .core import (
-    normal_interval_stats, run_binned_kprop_k2, make_gaussian_edges, make_relu_post_edges,
-    linear_step_k2, relu_step_k2, gaussian_initial_state, unconditional_mean,
-    _phi, _Phi, exact_relu_covariance,
+    run_binned_kprop_k2, linear_step_k2, relu_step_k2, gaussian_initial_state,
+    unconditional_mean, _phi, _Phi, exact_relu_covariance,
 )
 
 

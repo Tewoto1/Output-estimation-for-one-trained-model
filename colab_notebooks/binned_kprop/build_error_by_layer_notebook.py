@@ -1,0 +1,207 @@
+"""Generates error_by_layer_colab.ipynb (valid nbformat-4 JSON).
+
+PER-BIN accuracy of the binned-K2 predictor, by layer and step -- NOT the congregated overall
+(mean, cov). At each step we know the bin regions on the spike coordinate (the grid edges) and the
+predictor's CONDITIONAL bulk moments per bin (mu_a, Sigma_a). We then run a lot of MC, bin the
+samples by the SAME spike-coordinate edges, and measure the empirical conditional (mean, cov) of the
+bulk inside each bin. The per-bin error isolates the WITHIN-bin Gaussian-closure quality (it drops the
+between-bin spread that the congregated cov mixes in).
+
+Steps: lin{l} = pre-activation of layer l (bins on the pre-edges, spike = A^+),
+       relu{l} = post-activation of layer l (bins on the post-edges, spike = ReLU(A^+)).
+
+Outputs: (1) per-bin cov/mean error vs bin (for a chosen step) -- which bin REGIONS are inaccurate;
+         (2) the p-weighted AVERAGE per-bin error per step, and how it scales with width.
+
+Run:  python "colab_notebooks/binned_kprop/build_error_by_layer_notebook.py"
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from _nb import NotebookBuilder, BOOTSTRAP_CELL
+
+nb = NotebookBuilder()
+md, code = nb.md, nb.code
+
+md(r"""# Per-**bin** accuracy by layer & step (not congregated)
+
+The binned predictor's real approximation is, *inside each bin* `α` (a region of the spike coordinate),
+`B | A∈bin_α ≈ N(μ_α, Σ_α)`. So the honest error to measure is **per bin**: compare `(μ_α, Σ_α)` to the
+**MC-empirical** conditional mean/cov of the bulk over the samples whose spike falls in bin `α`. This
+drops the between-bin spread that the congregated `unconditional_mean_cov` mixes in, and isolates the
+**within-bin Gaussian-closure** quality.
+
+Procedure: run the algorithm → read off the **bin edges** (where the bins are) and the per-bin
+`(p_α, μ_α, Σ_α)` at every step → run a lot of MC → bin samples by the *same* edges → empirical
+`(mean_α, cov_α)`. We report per-bin error for a few bins, and the **p-weighted average per-bin error**
+per step and its width scaling.
+
+Steps: `lin{l}` (pre-activation, spike `A⁺`), `relu{l}` (post-activation, spike `ReLU(A⁺)`).""")
+
+code(r"""!pip install -q scipy""")
+code(BOOTSTRAP_CELL)
+
+# =============================================================================
+md(r"""## Config""")
+code(r"""
+import os, time
+import numpy as np
+import matplotlib.pyplot as plt
+from Mecha_preds.binned_kprop.core import (gaussian_initial_state, linear_step_k2, relu_step_k2,
+    lloyd_max_edges, lloyd_max_edges_mixture, make_gaussian_edges, make_relu_post_edges, _spike_mixture)
+
+QUICK      = True
+WIDTHS     = [32, 64, 128] if QUICK else [32, 64, 128, 256, 512, 1024]
+DEPTH      = 3
+NUMBINS    = 21
+THETA      = 1.0
+OUT_DIM    = 8
+SEED       = 10
+GRID       = "wasserstein"                # "wasserstein" | "fixed"
+MC_SAMPLES = 2_000_000 if QUICK else 20_000_000
+MC_BATCH   = 200_000
+MIN_COUNT  = 2000                         # skip a bin's error if it has fewer MC samples (too noisy)
+PLOT_STEP  = 2 * DEPTH - 1                # which step's per-bin curve to plot (default: last relu)
+CKPT_DIR   = "checkpoints/binned_kprop/perbin"; os.makedirs(CKPT_DIR, exist_ok=True)
+STEP_LABELS = [f"{k}{l}" for l in range(DEPTH) for k in ("lin", "relu")]
+print(f"QUICK={QUICK} widths={WIDTHS} depth={DEPTH} num_bins={NUMBINS} grid={GRID} MC={MC_SAMPLES:,}")
+print(f"steps: {STEP_LABELS}   (plotting per-bin curve for step {STEP_LABELS[PLOT_STEP]})")
+""")
+
+# =============================================================================
+md(r"""## Helpers — capture bin regions + per-bin predictor moments, and the MC per-bin conditional moments""")
+code(r"""
+def net(n, depth, seed, theta=THETA, out_dim=OUT_DIM):
+    rng = np.random.default_rng(seed); P = np.zeros((n, n)); P[0, 0] = theta
+    Ws = [(rng.standard_normal((n, n)) / np.sqrt(n) + P, None) for _ in range(depth)]
+    Ws.append((rng.standard_normal((out_dim, n)) / np.sqrt(n), None)); return Ws
+
+# propagate; capture per step: (label, spike-edges, p, a, mu, Sigma). The state after linear_step is
+# binned on pre_edges (spike = A^+); after relu_step on post_edges (spike = ReLU(A^+)).
+def capture(Ws, n):
+    d = n - 1
+    init = lloyd_max_edges(0.0, 1.0, NUMBINS)[0] if GRID == "wasserstein" else make_gaussian_edges(NUMBINS)
+    st = gaussian_initial_state(d, init); caps = []
+    for li in range(DEPTH):
+        M = Ws[li][0]
+        if GRID == "wasserstein":
+            p, mY, sY = _spike_mixture(st, M)
+            pre = lloyd_max_edges_mixture(p, mY, sY, NUMBINS)[0]
+            post = lloyd_max_edges_mixture(p, mY, sY, NUMBINS, rectified=True)[0]
+        else:
+            pre, post = make_gaussian_edges(NUMBINS), make_relu_post_edges(NUMBINS)
+        st = linear_step_k2(st, M, pre);  caps.append(("lin", pre, st.p.copy(), st.a.copy(), st.mu.copy(), st.Sigma.copy()))
+        st = relu_step_k2(st, post);      caps.append(("relu", post, st.p.copy(), st.a.copy(), st.mu.copy(), st.Sigma.copy()))
+    return caps
+
+# MC empirical conditional (mean, cov, count) of the bulk PER BIN, per step, streamed.
+def mc_perbin(Ws, n, caps, S, B, seed):
+    L = len(Ws) - 1; edges = [caps[i][1] for i in range(2 * L)]; m = [len(e) - 1 for e in edges]; d = n - 1
+    sm = [np.zeros((m[i], d)) for i in range(2 * L)]
+    sq = [np.zeros((m[i], d, d)) for i in range(2 * L)]
+    cnt = [np.zeros(m[i], dtype=np.int64) for i in range(2 * L)]
+    def acc(i, spike, bulk):
+        idx = np.clip(np.searchsorted(edges[i], spike, side="right") - 1, 0, m[i] - 1)
+        for a in np.unique(idx):
+            msk = idx == a; Bm = bulk[msk]
+            sm[i][a] += Bm.sum(0); sq[i][a] += Bm.T @ Bm; cnt[i][a] += Bm.shape[0]
+    rng = np.random.default_rng(seed); c = 0
+    while c < S:
+        b = min(B, S - c); h = rng.standard_normal((b, n))
+        for li, (W, _b) in enumerate(Ws):
+            z = h @ W.T
+            if li < L:
+                acc(2 * li, z[:, 0], z[:, 1:])
+                hz = np.maximum(z, 0.0); acc(2 * li + 1, hz[:, 0], hz[:, 1:]); h = hz
+        c += b
+    out = []
+    for i in range(2 * L):
+        means = np.zeros((m[i], d)); covs = np.zeros((m[i], d, d))
+        for a in range(m[i]):
+            if cnt[i][a] > 0:
+                mu = sm[i][a] / cnt[i][a]; means[a] = mu; covs[a] = sq[i][a] / cnt[i][a] - np.outer(mu, mu)
+        out.append((means, covs, cnt[i]))
+    return out
+
+def rel(a, b): return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-30))
+def mean_scaled(pm, mm, cov):                 # mean error normalized by the bin's activation scale
+    sc = np.sqrt((float(mm @ mm) + float(np.trace(cov))) / len(mm)); return float(np.linalg.norm(pm - mm) / (sc + 1e-30))
+print("helpers ready")
+""")
+
+# =============================================================================
+md(r"""## Run — per-bin error at every step (MC cached); p-weighted average per step""")
+code(r"""
+per_bin = {}   # [width] -> list over steps of dict(mean[m], cov[m], p[m], a[m], cnt[m], ok[m])
+avg = {}       # [width] -> list over steps of (avg_mean_err, avg_cov_err)  (p-weighted, resolvable bins)
+for n in WIDTHS:
+    import pickle
+    Ws = net(n, DEPTH, SEED); caps = capture(Ws, n)
+    key = os.path.join(CKPT_DIR, f"mcpb_w{n}_d{DEPTH}_nb{NUMBINS}_{GRID}_s{SEED}_S{MC_SAMPLES}.pkl")
+    if os.path.exists(key):
+        mc = pickle.load(open(key, "rb"))
+    else:
+        t0 = time.time(); mc = mc_perbin(Ws, n, caps, MC_SAMPLES, MC_BATCH, 10_000 + SEED)
+        pickle.dump(mc, open(key, "wb")); print(f"  n={n}: MC {time.time()-t0:.1f}s")
+    steps_pb = []; steps_avg = []
+    for i in range(len(caps)):
+        _lbl, _edg, p, a, mu, Sig = caps[i]; mmc, cmc, cnt = mc[i]; mm = len(p)
+        me = np.full(mm, np.nan); ce = np.full(mm, np.nan); ok = cnt >= MIN_COUNT
+        for al in range(mm):
+            if ok[al]:
+                me[al] = mean_scaled(mu[al], mmc[al], cmc[al]); ce[al] = rel(Sig[al], cmc[al])
+        w = p * ok; w = w / (w.sum() + 1e-30)
+        steps_pb.append(dict(mean=me, cov=ce, p=p, a=a, cnt=cnt, ok=ok))
+        steps_avg.append((float(np.nansum(w * np.nan_to_num(me))), float(np.nansum(w * np.nan_to_num(ce)))))
+    per_bin[n] = steps_pb; avg[n] = steps_avg
+    print(f"  n={n:5d} | p-wtd avg per-bin COV err by step: " +
+          "  ".join(f"{STEP_LABELS[i]}:{steps_avg[i][1]:.1e}" for i in range(len(caps))))
+print("(per-bin error uses only bins with >= MIN_COUNT MC samples; averages are p-weighted)")
+""")
+
+# =============================================================================
+md(r"""## Plot 1 — WHERE are the inaccurate bins? per-bin error vs bin (for one step)
+
+Per-bin mean & cov error against the bin representative `a` (the spike value of the bin), for the
+chosen `PLOT_STEP`, across widths. Bubble size ∝ bin mass `p`. This shows whether the error lives in
+particular bin regions (e.g. near the ReLU kink at 0, or the low-mass tails).""")
+code(r"""
+si = PLOT_STEP
+fig, ax = plt.subplots(1, 2, figsize=(12, 4.4))
+for n in WIDTHS:
+    d = per_bin[n][si]; ok = d["ok"]
+    ax[0].scatter(d["a"][ok], d["mean"][ok], s=300 * d["p"][ok] + 8, alpha=.6, label=f"n={n}")
+    ax[1].scatter(d["a"][ok], d["cov"][ok], s=300 * d["p"][ok] + 8, alpha=.6, label=f"n={n}")
+for a, t in zip(ax, ("per-bin MEAN error", "per-bin COV error")):
+    a.set_yscale("log"); a.set_xlabel(f"bin representative  a  (spike value at step {STEP_LABELS[si]})")
+    a.set_ylabel("error vs MC (within-bin)"); a.set_title(t + f" @ {STEP_LABELS[si]}  (size ∝ mass)")
+    a.grid(True, which="both", alpha=.25); a.legend(fontsize=8)
+fig.tight_layout(); plt.show()
+""")
+
+# =============================================================================
+md(r"""## Plot 2 — p-weighted **average** per-bin error, per step, vs width
+
+The average within-bin inaccuracy (not congregated). Left: trajectory across steps for each width
+(where does the within-bin closure degrade?). Right: scaling with width per step, with fitted slopes —
+does the within-bin closure error stay ~n⁻¹ (RMS) at early layers and flatten at later ones?""")
+code(r"""
+x = np.arange(len(STEP_LABELS)); W = np.array(WIDTHS, float)
+avg_cov = {n: np.array([avg[n][i][1] for i in range(len(STEP_LABELS))]) for n in WIDTHS}
+fig, ax = plt.subplots(1, 2, figsize=(12, 4.4))
+for n in WIDTHS:
+    ax[0].plot(x, avg_cov[n], "o-", label=f"n={n}")
+ax[0].set_yscale("log"); ax[0].set_xticks(x); ax[0].set_xticklabels(STEP_LABELS, rotation=45)
+ax[0].set_ylabel("p-wtd avg per-bin COV error"); ax[0].set_title("within-bin error across steps"); ax[0].grid(True, which="both", alpha=.25); ax[0].legend(fontsize=8)
+for i, lab in enumerate(STEP_LABELS):
+    ys = np.array([avg_cov[n][i] for n in WIDTHS])
+    sl = float(np.polyfit(np.log(W), np.log(ys + 1e-30), 1)[0])
+    ax[1].loglog(W, ys, "o-", label=f"{lab} ~ n^{sl:+.2f}")
+ax[1].set_xlabel("width n"); ax[1].set_ylabel("p-wtd avg per-bin COV error"); ax[1].set_title("width scaling per step"); ax[1].grid(True, which="both", alpha=.25); ax[1].legend(fontsize=7, ncol=2)
+fig.tight_layout(); plt.show()
+print("per-bin error isolates the within-bin closure; compare its trajectory/scaling to the earlier "
+      "congregated version -- the between-bin spread is now excluded.")
+""")
+
+nb.save(os.path.join(os.path.dirname(__file__), "error_by_layer_colab.ipynb"))

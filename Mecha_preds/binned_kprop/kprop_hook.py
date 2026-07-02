@@ -29,8 +29,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from .core import (BinnedK2State, find_bin, safe_bin_representative, symmetrize,
-                   SPIKE_COORD, _DEFAULT_MIN_PROB)
+from .binning import find_bin, safe_bin_representative, _DEFAULT_MIN_PROB
+from .core import BinnedK2State, symmetrize, SPIKE_COORD
 
 
 # --------------------------------------------------------------------------- #

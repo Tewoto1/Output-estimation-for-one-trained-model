@@ -23,7 +23,8 @@ from typing import Optional
 
 import numpy as np
 
-from .core import run_binned_kprop_k2, resolve_workers, SPIKE_COORD
+from .binning import resolve_workers
+from .core import run_binned_kprop_k2, SPIKE_COORD
 
 
 def default_binned_kprop_config() -> dict:
@@ -34,7 +35,9 @@ def default_binned_kprop_config() -> dict:
     is the Gaussian input scale; ``workers`` is the per-bin thread count -- ``"auto"``
     (default) parallelizes per machine (CUDA box -> 8, else min(8, cpu_count); env override
     ``BINNED_KPROP_WORKERS``), pass ``1`` for serial."""
-    return {"num_bins": 21, "num_bins_post": None, "bulk_relu": "exact", "input_std": 1.0,
+    return {"num_bins": 21, "num_bins_post": None,
+            "num_bins_pre_pos": None, "num_bins_pre_neg": None,
+            "bulk_relu": "exact", "input_std": 1.0,
             "grid": "fixed", "relu_merge": "post", "workers": "auto"}
 
 
@@ -66,7 +69,10 @@ def run_binned_kprop(model, input_dim: Optional[int] = None, config: Optional[di
     """Predict ``E[model(X)]`` for ``X ~ N(0, I)`` by coordinate-spike binned kprop (K=2).
 
     ``config`` keys: ``num_bins`` (the hyperparameter), ``num_bins_post``, ``bulk_relu``,
-    ``input_std``. ``add_spike=True`` adds ``spike_theta * e_{spike_coord} e^T`` to each
+    ``input_std``, and (``grid="wasserstein"`` only) ``num_bins_pre_pos`` / ``num_bins_pre_neg``
+    -- the positive / negative pre-activation bin budgets (defaults ``num_bins_post`` / ``num_bins``;
+    grow the positive side so ReLU, which keeps only positive bins, does not lose resolution).
+    ``add_spike=True`` adds ``spike_theta * e_{spike_coord} e^T`` to each
     square hidden matrix (use when the spike is not already in the stored weights).
     Returns ``{"mean", "metadata", ...}``.
     """
@@ -95,6 +101,8 @@ def run_binned_kprop(model, input_dim: Optional[int] = None, config: Optional[di
     res = run_binned_kprop_k2(
         weights, input_dim, num_bins=int(cfg["num_bins"]), grid=str(cfg.get("grid", "fixed")),
         num_bins_post=(None if cfg["num_bins_post"] is None else int(cfg["num_bins_post"])),
+        num_bins_pre_pos=(None if cfg.get("num_bins_pre_pos") is None else int(cfg["num_bins_pre_pos"])),
+        num_bins_pre_neg=(None if cfg.get("num_bins_pre_neg") is None else int(cfg["num_bins_pre_neg"])),
         input_std=float(cfg["input_std"]), bulk_relu=str(cfg["bulk_relu"]),
         relu_merge=str(cfg.get("relu_merge", "post")),
         workers=cfg.get("workers", "auto"),

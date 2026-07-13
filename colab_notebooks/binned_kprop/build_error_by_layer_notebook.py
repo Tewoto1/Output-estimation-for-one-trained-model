@@ -72,7 +72,10 @@ MC_SAMPLES = 2_000_000 if QUICK else 20_000_000
 MC_ELEMS   = 2.0e8 if MC_DEVICE == "cuda" else 4.0e7   # width-aware batch (~constant memory: batch*n)
 MC_WORKERS = 1 if MC_DEVICE == "cuda" else max(1, os.cpu_count() or 1)  # CPU path: parallel sample shards
 def mc_batch(n): return int(min(MC_SAMPLES, 8_000_000, max(100_000, MC_ELEMS // n)))  # fewer batches at small n
-MIN_COUNT  = 2000                         # skip a bin's error if it has fewer MC samples (too noisy)
+MIN_COUNT  = 2000                         # base gate: skip a bin (mean/diagonal error) below this MC count
+COV_MIN_PER_DIM = 200                     # FULL-cov gate scales with width: an empirical dxd cov needs
+                                          # ~d samples to beat its own noise (rel err ~ sqrt(d/N)); require
+                                          # >= COV_MIN_PER_DIM * d samples before trusting a bin's full cov
 PLOT_STEP  = 2 * DEPTH - 1                # which step's per-bin curve to plot (default: last relu)
 CKPT_DIR   = "checkpoints/binned_kprop/perbin"; os.makedirs(CKPT_DIR, exist_ok=True)
 STEP_LABELS = [f"{k}{l}" for l in range(DEPTH) for k in ("lin", "relu")]
@@ -204,6 +207,11 @@ def mc_perbin(Ws, n, caps, S, B, seed):
     return mc_perbin_np(Ws, n, caps, S, B, seed, workers=MC_WORKERS)
 
 def rel(a, b): return float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-30))
+def cov_diag_rel(pred, mc):                   # width-ROBUST cov error: diagonal variances only.
+    dp = np.diag(pred); dm = np.diag(mc)      # MC noise on a variance is ~sqrt(2/N) -- independent of d,
+    return float(np.linalg.norm(dp - dm) / (np.linalg.norm(dm) + 1e-30))   # unlike full Frobenius ~sqrt(d/N)
+def cov_noise_floor(d, N):                    # rel-Frobenius error of an empirical dxd cov from N samples
+    return float(np.sqrt(d / max(N, 1)))      # (= the error you'd measure even with a PERFECT predictor)
 def mean_scaled(pm, mm, cov):                 # mean error normalized by the bin's activation scale
     sc = np.sqrt((float(mm @ mm) + float(np.trace(cov))) / len(mm)); return float(np.linalg.norm(pm - mm) / (sc + 1e-30))
 print("helpers ready")
@@ -224,39 +232,64 @@ for n in WIDTHS:
         t0 = time.time(); mc = mc_perbin(Ws, n, caps, MC_SAMPLES, mc_batch(n), 10_000 + SEED)
         pickle.dump(mc, open(key, "wb")); print(f"  n={n}: MC {time.time()-t0:.1f}s  (batch {mc_batch(n):,}, {MC_DEVICE})")
     steps_pb = []; steps_avg = []
+    minc_cov = max(MIN_COUNT, int(COV_MIN_PER_DIM * (n - 1)))   # width-scaled gate for the FULL cov
     for i in range(len(caps)):
         _lbl, _edg, p, a, mu, Sig = caps[i]; mmc, cmc, cnt = mc[i]; mm = len(p)
-        me = np.full(mm, np.nan); ce = np.full(mm, np.nan); ok = cnt >= MIN_COUNT
+        me = np.full(mm, np.nan); ce = np.full(mm, np.nan); cd = np.full(mm, np.nan); nf = np.full(mm, np.nan)
+        ok = cnt >= MIN_COUNT; okc = cnt >= minc_cov            # base gate (mean/diag) | strict gate (full cov)
         for al in range(mm):
             if ok[al]:
-                me[al] = mean_scaled(mu[al], mmc[al], cmc[al]); ce[al] = rel(Sig[al], cmc[al])
-        w = p * ok; w = w / (w.sum() + 1e-30)
-        steps_pb.append(dict(mean=me, cov=ce, p=p, a=a, cnt=cnt, ok=ok))
-        steps_avg.append((float(np.nansum(w * np.nan_to_num(me))), float(np.nansum(w * np.nan_to_num(ce)))))
+                me[al] = mean_scaled(mu[al], mmc[al], cmc[al])
+                cd[al] = cov_diag_rel(Sig[al], cmc[al])          # width-robust
+                ce[al] = rel(Sig[al], cmc[al])                   # full Frobenius (noise ~ sqrt(d/N))
+                nf[al] = cov_noise_floor(n - 1, cnt[al])         # that noise floor, per bin
+        wb = p * ok;  wb = wb / (wb.sum() + 1e-30)               # weights for mean/diag
+        wf = p * okc; wf = wf / (wf.sum() + 1e-30)               # weights for full cov (strict gate)
+        steps_pb.append(dict(mean=me, cov=ce, cov_diag=cd, nf=nf, p=p, a=a, cnt=cnt, ok=ok, okc=okc))
+        steps_avg.append((float(np.nansum(wb * np.nan_to_num(me))),
+                          float(np.nansum(wf * np.nan_to_num(ce))),
+                          float(np.nansum(wb * np.nan_to_num(cd)))))
     per_bin[n] = steps_pb; avg[n] = steps_avg
-    print(f"  n={n:5d} | p-wtd avg per-bin COV err by step: " +
+    print(f"  n={n:5d} | ROBUST diag-cov err by step: " +
+          "  ".join(f"{STEP_LABELS[i]}:{steps_avg[i][2]:.1e}" for i in range(len(caps))))
+    print(f"        | full-cov err (>= {minc_cov:,} samp/bin gate): " +
           "  ".join(f"{STEP_LABELS[i]}:{steps_avg[i][1]:.1e}" for i in range(len(caps))))
-print("(per-bin error uses only bins with >= MIN_COUNT MC samples; averages are p-weighted)")
+print("(mean/diagonal use >= MIN_COUNT; full cov uses the width-scaled gate; averages are p-weighted)")
 """)
 
 # =============================================================================
 md(r"""## Plot 1 — WHERE are the inaccurate bins? per-bin error vs bin (for one step)
 
-Per-bin mean & cov error against the bin representative `a` (the spike value of the bin), for the
-chosen `PLOT_STEP`, across widths. Bubble size ∝ bin mass `p`. This shows whether the error lives in
-particular bin regions (e.g. near the ReLU kink at 0, or the low-mass tails).""")
+Per-bin cov error against the bin representative `a`, bubble size ∝ mass `p`. **Two things to know before
+reading this:**
+
+- **Wasserstein/Lloyd–Max bins are NOT equal-mass.** They minimize squared quantization distortion, which
+  places bin density ∝ f^(1/3), *not* ∝ f. So mass per bin is deliberately unequal (20×+ range: dense
+  near the mode, sparse in the tails). Equal-mass would be a *different* objective (quantile binning) and
+  is worse for the K=2 propagation. Also, the spike law is a Gaussian **mixture** (one component per prior
+  bin) with a post-ReLU **atom at 0**, so it is multimodal — a bin whose representative lands in a valley
+  gets ≈0 mass, which is why you see tiny-mass bins *between* big ones. Those are excluded from the average.
+- **Low-mass bins show high FULL-cov error because of MC noise, not the predictor.** An empirical d×d
+  covariance from N samples has rel error ≈ sqrt(d/N) regardless of the predictor. The **dashed line** is
+  that noise floor per bin — low-mass bins sit right on it. The **right panel** uses only the diagonal
+  variances, whose noise is ≈ sqrt(2/N) *independent of width*, so it reveals the real per-bin structure.""")
 code(r"""
 si = PLOT_STEP
 fig, ax = plt.subplots(1, 2, figsize=(12, 4.4))
 for n in WIDTHS:
-    d = per_bin[n][si]; ok = d["ok"]
-    ax[0].scatter(d["a"][ok], d["mean"][ok], s=300 * d["p"][ok] + 8, alpha=.6, label=f"n={n}")
-    ax[1].scatter(d["a"][ok], d["cov"][ok], s=300 * d["p"][ok] + 8, alpha=.6, label=f"n={n}")
-for a, t in zip(ax, ("per-bin MEAN error", "per-bin COV error")):
-    a.set_yscale("log"); a.set_xlabel(f"bin representative  a  (spike value at step {STEP_LABELS[si]})")
-    a.set_ylabel("error vs MC (within-bin)"); a.set_title(t + f" @ {STEP_LABELS[si]}  (size ∝ mass)")
-    a.grid(True, which="both", alpha=.25); a.legend(fontsize=8)
+    dd = per_bin[n][si]; ok = dd["ok"]; o = np.argsort(dd["a"][ok])
+    sc = ax[0].scatter(dd["a"][ok], dd["cov"][ok], s=300 * dd["p"][ok] + 8, alpha=.55, label=f"n={n}")
+    # dashed = MC noise floor sqrt(d/N_bin): the error you'd measure even if the predictor were PERFECT.
+    ax[0].plot(dd["a"][ok][o], dd["nf"][ok][o], "--", lw=1.2, alpha=.8, color=sc.get_facecolor()[0])
+    ax[1].scatter(dd["a"][ok], dd["cov_diag"][ok], s=300 * dd["p"][ok] + 8, alpha=.55, label=f"n={n}")
+ax[0].set_title(f"FULL cov error @ {STEP_LABELS[si]}   (dashed = MC noise floor)")
+ax[1].set_title(f"DIAGONAL cov error @ {STEP_LABELS[si]}   (width-robust)")
+for a in ax:
+    a.set_yscale("log"); a.set_xlabel(f"bin representative  a  (spike value; bubble ∝ mass p)")
+    a.set_ylabel("rel error vs MC (within-bin)"); a.grid(True, which="both", alpha=.25); a.legend(fontsize=8)
 fig.tight_layout(); plt.show()
+print("Low-mass bins sit ON the dashed noise floor in the LEFT panel -> their 'error' is MC sampling noise,")
+print("not predictor error. The RIGHT (diagonal) panel is width-robust and shows the real per-bin structure.")
 """)
 
 # =============================================================================
@@ -267,20 +300,21 @@ The average within-bin inaccuracy (not congregated). Left: trajectory across ste
 does the within-bin closure error stay ~n⁻¹ (RMS) at early layers and flatten at later ones?""")
 code(r"""
 x = np.arange(len(STEP_LABELS)); W = np.array(WIDTHS, float)
-avg_cov = {n: np.array([avg[n][i][1] for i in range(len(STEP_LABELS))]) for n in WIDTHS}
+avg_cov      = {n: np.array([avg[n][i][1] for i in range(len(STEP_LABELS))]) for n in WIDTHS}  # FULL (noise-limited at shallow layers)
+avg_cov_diag = {n: np.array([avg[n][i][2] for i in range(len(STEP_LABELS))]) for n in WIDTHS}  # width-robust (diagonal)
 fig, ax = plt.subplots(1, 2, figsize=(12, 4.4))
 for n in WIDTHS:
-    ax[0].plot(x, avg_cov[n], "o-", label=f"n={n}")
+    ax[0].plot(x, avg_cov_diag[n], "o-", label=f"n={n}")
 ax[0].set_yscale("log"); ax[0].set_xticks(x); ax[0].set_xticklabels(STEP_LABELS, rotation=45)
-ax[0].set_ylabel("p-wtd avg per-bin COV error"); ax[0].set_title("within-bin error across steps"); ax[0].grid(True, which="both", alpha=.25); ax[0].legend(fontsize=8)
+ax[0].set_ylabel("p-wtd avg diagonal-cov error"); ax[0].set_title("ROBUST within-bin error across steps"); ax[0].grid(True, which="both", alpha=.25); ax[0].legend(fontsize=8)
 for i, lab in enumerate(STEP_LABELS):
-    ys = np.array([avg_cov[n][i] for n in WIDTHS])
+    ys = np.array([avg_cov_diag[n][i] for n in WIDTHS])
     sl = float(np.polyfit(np.log(W), np.log(ys + 1e-30), 1)[0])
     ax[1].loglog(W, ys, "o-", label=f"{lab} ~ n^{sl:+.2f}")
-ax[1].set_xlabel("width n"); ax[1].set_ylabel("p-wtd avg per-bin COV error"); ax[1].set_title("width scaling per step"); ax[1].grid(True, which="both", alpha=.25); ax[1].legend(fontsize=7, ncol=2)
+ax[1].set_xlabel("width n"); ax[1].set_ylabel("p-wtd avg diagonal-cov error"); ax[1].set_title("width scaling (robust metric)"); ax[1].grid(True, which="both", alpha=.25); ax[1].legend(fontsize=7, ncol=2)
 fig.tight_layout(); plt.show()
-print("per-bin error isolates the within-bin closure; compare its trajectory/scaling to the earlier "
-      "congregated version -- the between-bin spread is now excluded.")
+print("Primary plot uses the width-robust DIAGONAL metric (avg_cov_diag). The full-Frobenius avg is kept")
+print("as avg_cov for reference, but is noise-limited at shallow layers/low-mass bins (see Plot 1).")
 """)
 
 nb.save(os.path.join(os.path.dirname(__file__), "error_by_layer_colab.ipynb"))

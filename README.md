@@ -31,6 +31,11 @@ Mecha_preds/      mechanistic predictors
   binned_kprop/     coordinate-spike binned kprop (K=2): HMM over the spiked coord e₁ +
                     conditional bulk kprop per bin (M=W+e₁e₁ᵀ); num_bins hyperparam.
                     Verified width law MSE~n⁻². See Mecha_preds/binned_kprop/README.md
+  analytic_kprop/   ANALYTIC AFFINE K=2 (same M=W+e₁e₁ᵀ class): bulk-given-spike law
+                    compressed to ONE affine family N(μ₀+μ₁y, Σ₀+Σ₁y); the spike is
+                    discretized only transiently into num_nodes closed-form quadrature
+                    cells per layer (O(1) congruences/layer, not O(num_bins)). Spec:
+                    writeups/analytic_affine_kprop.pdf; see Mecha_preds/analytic_kprop/README.md
 colab_notebooks/  generated notebooks + their build_*.py generators (+ shared _nb.py)
 utils.py          device / seeding / numpy helpers
 ```

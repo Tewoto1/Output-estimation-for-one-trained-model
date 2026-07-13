@@ -480,6 +480,12 @@ def cov_rank1_structure(a: np.ndarray, Sigma: np.ndarray, p: Optional[np.ndarray
     diag_num = float((w * (diagA * diagB).sum(1)).sum())
     diag_frac = float(np.clip(diag_num / (den + _EPS), 0.0, 1.0)) if den > 0 else float("nan")
 
+    # ABSOLUTE across-bin cov variation (debiased Frobenius) and the DIAGONAL-only relative variation
+    # (variances are what the next ReLU is most sensitive to) -- for width-scaling power-law fits.
+    cov_abs = float(np.sqrt(max(0.0, den)))
+    diag_ref_norm = float(np.linalg.norm(np.diag(Sref)))
+    diag_var_rel = float(np.sqrt(max(0.0, diag_num)) / (diag_ref_norm + _EPS))
+
     # per-bin rank-1 (squared scale) + direction alignment, from cross-symmetrized M_a
     r1 = np.zeros(m); align = np.zeros(m); aw = np.zeros(m)
     f = 0.5 * (fA + fB)
@@ -512,7 +518,8 @@ def cov_rank1_structure(a: np.ndarray, Sigma: np.ndarray, p: Optional[np.ndarray
         if nu > 0:
             cos_pred = abs(float(v @ (u / nu)))
 
-    return {"cov_var_rel": cov_var_rel, "family_coherence": coherence, "diag_frac": diag_frac,
+    return {"cov_var_rel": cov_var_rel, "cov_abs": cov_abs, "diag_var_rel": diag_var_rel,
+            "family_coherence": coherence, "diag_frac": diag_frac,
             "common_dir": v, "dir_alignment": dir_alignment, "rank1_sq_frac": rank1_sq,
             "f": f, "f_R2_linear": float(f_lin), "f_R2_quadratic": float(f_quad),
             "cos_predicted": cos_pred, "ref_frobenius": ref_fro}
@@ -536,8 +543,9 @@ def structure_report(states: Dict[str, object], Ws: Sequence[Tuple[np.ndarray, O
         out.append({
             "layer": li, "which": which,
             "mean_R2": ml["R2"], "mean_var_rel": ml["mean_var_rel"], "mean_slope_vs_u": cos_c_u,
-            "cov_var_rel": cs["cov_var_rel"], "cov_family_coherence": cs["family_coherence"],
-            "cov_diag_frac": cs["diag_frac"],
+            "cov_var_rel": cs["cov_var_rel"], "cov_abs": cs["cov_abs"],
+            "cov_diag_var_rel": cs["diag_var_rel"], "cov_ref_fro": cs["ref_frobenius"],
+            "cov_family_coherence": cs["family_coherence"], "cov_diag_frac": cs["diag_frac"],
             "cov_dir_alignment": cs["dir_alignment"], "cov_rank1_sq": cs["rank1_sq_frac"],
             "cov_dir_vs_u": cs["cos_predicted"],
             "cov_f_R2_linear": cs["f_R2_linear"], "cov_f_R2_quadratic": cs["f_R2_quadratic"],

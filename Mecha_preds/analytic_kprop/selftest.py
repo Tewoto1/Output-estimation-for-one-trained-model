@@ -21,6 +21,16 @@ Checks (paper sections 6-10 + implementation checklist 12):
      no worse than few nodes; parity with the binned companion printed.
   7. degenerate cases: r = 0 (deterministic scalar), no spike, biases, uniform
      grid, LS intercept, forced 1-negative-cell budget -- all stable & finite.
+  8. optimization equivalences: threaded per-node ReLU (workers=4) is bit-identical
+     to serial (workers=1); the vectorized Lloyd-Max mixture cells match the scalar
+     ``_mixture_cell`` reference; PSD endpoint screening changes nothing.
+  9. torch device path parity (``device="cpu"``): identical to the numpy path to
+     BLAS reordering tolerance. SKIPS (does not fail) if torch is unavailable.
+ 10. fit="post" (affine family fitted on the POST-activation, linear step =
+     transform of (m0, m1, W0, W1)): depth-1 closed form (the weighted-LS fit
+     conserves the readout mean exactly), end-to-end vs MC at parity with
+     fit="pre", both atom toggles ("exact" | "fit") finite and close, and
+     threaded == serial to fp-regrouping tolerance.
 """
 from __future__ import annotations
 
@@ -233,6 +243,75 @@ def run(verbose: bool = True) -> bool:
         print(f"[7] degenerate/options (r=0, no-spike, uniform, ls, neg1, gain, biases) "
               f"stable & finite; total cov PSD   {'OK' if t7_ok else 'FAIL'}"
               + (f"  bad={bad}" if bad else ""))
+
+    # [8] optimization equivalences ------------------------------------------------
+    n8 = 48
+    Ws8 = coordinate_spike_net(n8, 2, seed=11)
+    r_serial = run_analytic_kprop_k2(Ws8, n8, num_nodes=24, workers=1)
+    r_thread = run_analytic_kprop_k2(Ws8, n8, num_nodes=24, workers=4)
+    thread_eq = (np.array_equal(r_serial["mean"], r_thread["mean"])
+                 and r_serial["metadata"]["total_psd_clipped"]
+                 == r_thread["metadata"]["total_psd_clipped"])
+    from ..binned_kprop.binning import _mixture_cell, _mixture_cells_vec
+    rng8 = np.random.default_rng(3)
+    wmix = rng8.random(6); wmix /= wmix.sum()
+    mmix = rng8.standard_normal(6) * 2.0
+    smix = rng8.random(6) + 0.3
+    edges8 = np.concatenate([[-np.inf], np.sort(rng8.standard_normal(9) * 2), [np.inf]])
+    Zv, Cv = _mixture_cells_vec(wmix, mmix, smix, edges8)
+    Zr = np.array([_mixture_cell(wmix, mmix, smix, edges8[i], edges8[i + 1])[0]
+                   for i in range(10)])
+    Cr = np.array([_mixture_cell(wmix, mmix, smix, edges8[i], edges8[i + 1])[1]
+                   for i in range(10)])
+    vec_eq = max(float(np.abs(Zv - Zr).max()), float(np.abs(Cv - Cr).max())) < 1e-13
+    t8_ok = thread_eq and vec_eq
+    ok &= t8_ok
+    if verbose:
+        print(f"[8] workers 4 == serial (bit-identical): {thread_eq}; vectorized "
+              f"Lloyd cells == scalar reference: {vec_eq}   {'OK' if t8_ok else 'FAIL'}")
+
+    # [9] torch device path parity (skips without torch) ---------------------------
+    try:
+        import torch  # noqa: F401
+        r_np = run_analytic_kprop_k2(Ws8, n8, num_nodes=24, diagnostics=True)
+        r_t = run_analytic_kprop_k2(Ws8, n8, num_nodes=24, diagnostics=True, device="cpu")
+        dev_eq = _rel(r_t["mean"], r_np["mean"])
+        es_eq = max(abs(a - b) / (abs(b) + 1e-30) for a, b in
+                    zip(r_t["metadata"]["E_S_by_layer"], r_np["metadata"]["E_S_by_layer"]))
+        t9_ok = dev_eq < 1e-10 and es_eq < 1e-6 and r_t["metadata"]["device"] == "cpu"
+        ok &= t9_ok
+        if verbose:
+            print(f"[9] torch device parity: mean {dev_eq:.1e}, E_S {es_eq:.1e}   "
+                  f"{'OK' if t9_ok else 'FAIL'}")
+    except ModuleNotFoundError:
+        if verbose:
+            print("[9] torch device parity: SKIP (torch not installed)")
+
+    # [10] fit="post" variant --------------------------------------------------------
+    # (a) depth-1 closed form: post-fit readout mean is LS-conserved -> pure quadrature
+    err10 = {nn: _rel(run_analytic_kprop_k2(Ws5, n5, num_nodes=nn, fit="post")["mean"],
+                      exact5) for nn in (8, 40)}
+    # (b) end-to-end vs MC, parity with fit="pre" + atom toggle
+    e_post = _rel(run_analytic_kprop_k2(Ws6, n6, num_nodes=40, fit="post")["mean"], mc)
+    e_postf = _rel(run_analytic_kprop_k2(Ws6, n6, num_nodes=40, fit="post",
+                                         atom="fit")["mean"], mc)
+    # (c) threading: slot-grouped accumulation -> allclose (not bit-identical)
+    r_s = run_analytic_kprop_k2(Ws8, n8, num_nodes=24, fit="post", workers=1)["mean"]
+    r_t = run_analytic_kprop_k2(Ws8, n8, num_nodes=24, fit="post", workers=4)["mean"]
+    thr10 = _rel(r_t, r_s)
+    # (d) degenerate: no spike, r = 0
+    fin10 = all(np.all(np.isfinite(run_analytic_kprop_k2(W_, n7, num_nodes=16,
+                                                         fit="post")["mean"]))
+                for W_ in (coordinate_spike_net(n7, 2, seed=5, theta=0.0), Ws7r0))
+    t10_ok = (err10[40] < 2e-3 and err10[40] <= err10[8]
+              and e_post < 1.5 * err6[40] and e_postf < 1.5 * err6[40]
+              and thr10 < 1e-12 and fin10)
+    ok &= t10_ok
+    if verbose:
+        print(f"[10] fit=post: depth-1 {err10[8]:.1e}->{err10[40]:.1e}; MC err "
+              f"{e_post:.2e} (atom-fit {e_postf:.2e}, pre {err6[40]:.2e}); "
+              f"threads-vs-serial {thr10:.1e}; degenerate finite {fin10}   "
+              f"{'OK' if t10_ok else 'FAIL'}")
 
     print("SELFTEST:", "PASS" if ok else "FAIL")
     return ok

@@ -33,18 +33,28 @@ def default_analytic_kprop_config() -> dict:
     ``bulk_relu`` is the per-node Gaussian-ReLU backend ('exact' = exact bivariate
     covariance, 'gain' = leading-order gain, 'kprop' = harmonic kprop, torch);
     ``cov_intercept`` = 'mc' (moment-conservative, paper eq 90) or 'ls';
-    ``input_std`` is the Gaussian input scale."""
+    ``input_std`` is the Gaussian input scale; ``workers`` threads the per-node
+    Gaussian-ReLU loop like binned_kprop ("auto" = parallel per machine, 1 = serial,
+    identical results either way; env override ``BINNED_KPROP_WORKERS``); ``device``
+    (e.g. "cuda") offloads the Sigma-stack congruences to torch (numpy fallback)."""
     return {"num_nodes": 40, "num_nodes_neg": None, "num_nodes_pos": None,
             "grid": "w2", "bulk_relu": "exact", "cov_intercept": "mc",
-            "input_std": 1.0, "diagnostics": False}
+            "fit": "pre", "atom": "exact",
+            "input_std": 1.0, "diagnostics": False,
+            "workers": "auto", "device": None}
 
 
 def config_summary(config: Optional[dict] = None) -> str:
     c = default_analytic_kprop_config()
     if config:
         c.update(config)
+    from ..binned_kprop.binning import resolve_workers
+    fit = c.get("fit", "pre")
+    fit_s = fit + (f"/atom-{c.get('atom', 'exact')}" if fit == "post" else "")
     return (f"ANALYTIC-KPROP(K=2, num_nodes={c['num_nodes']}, grid={c['grid']}, "
-            f"bulk_relu={c['bulk_relu']}, cov_intercept={c['cov_intercept']})")
+            f"fit={fit_s}, bulk_relu={c['bulk_relu']}, cov_intercept={c['cov_intercept']}, "
+            f"workers={resolve_workers(c.get('workers', 'auto'))}, "
+            f"device={c.get('device') or 'numpy'})")
 
 
 def _weights_from_model(model):
@@ -96,7 +106,10 @@ def run_analytic_kprop(model, input_dim: Optional[int] = None, config: Optional[
         num_nodes_pos=(None if cfg.get("num_nodes_pos") is None else int(cfg["num_nodes_pos"])),
         grid=str(cfg["grid"]), bulk_relu=str(cfg["bulk_relu"]),
         cov_intercept=str(cfg["cov_intercept"]), input_std=float(cfg["input_std"]),
-        diagnostics=bool(cfg.get("diagnostics", False)), collect=collect)
+        fit=str(cfg.get("fit", "pre")), atom=str(cfg.get("atom", "exact")),
+        diagnostics=bool(cfg.get("diagnostics", False)),
+        workers=cfg.get("workers", "auto"), device=cfg.get("device"),
+        collect=collect)
     res["metadata"]["config"] = config_summary(config)
     res["metadata"]["add_spike"] = bool(add_spike)
     if add_spike:

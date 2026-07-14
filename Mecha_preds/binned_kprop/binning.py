@@ -320,11 +320,33 @@ def _mixture_cell(w: np.ndarray, m: np.ndarray, s: np.ndarray, a: float, b: floa
     return Z, fm / Z
 
 
+def _mixture_cells_vec(w: np.ndarray, m: np.ndarray, s: np.ndarray, edges: np.ndarray
+                       ) -> Tuple[np.ndarray, np.ndarray]:
+    """Vectorized ``_mixture_cell`` over ALL cells of an edge grid at once.
+
+    The same closed forms, evaluated as (num_components, num_cells) arrays -- removes
+    the per-cell python loop that dominated the Lloyd-Max iteration cost. Returns
+    ``(mass, centroid)`` arrays of length ``num_cells``; empty cells (mass <= _TINY)
+    get mass 0 and the finite-midpoint representative, exactly like ``_mixture_cell``.
+    """
+    lo, hi = edges[:-1], edges[1:]
+    al = (lo[None, :] - m[:, None]) / s[:, None]              # (K, J); +-inf edges OK
+    be = (hi[None, :] - m[:, None]) / s[:, None]
+    Zc = _Phi(be) - _Phi(al)
+    Z = w @ Zc                                                # (J,) cell masses
+    fm = w @ (m[:, None] * Zc + s[:, None] * (_phi(al) - _phi(be)))   # unnormalized 1st moments
+    mid = np.where(np.isfinite(lo) & np.isfinite(hi), 0.5 * (lo + hi), 0.0)
+    ok = Z > _TINY
+    cent = np.where(ok, fm / np.where(ok, Z, 1.0), mid)
+    return np.where(ok, Z, 0.0), cent
+
+
 def _lloyd_max_mixture_interval(w, m, s, lo, hi, num_pts, *, iters=1000, tol=1e-10):
     """Lloyd-Max W2 quantizer of the Gaussian mixture restricted to ``[lo, hi)`` (closed form).
 
     ``iters`` defaults to 1000: a multimodal mixture converges to the Lloyd fixed point more
-    slowly than a single Gaussian, and each iteration is only O(num_pts * num_components)."""
+    slowly than a single Gaussian, and each iteration is only O(num_pts * num_components),
+    fully vectorized across cells (``_mixture_cells_vec``)."""
     from scipy.special import ndtri
     if num_pts <= 1:
         return np.array([lo, hi], float), np.array([_mixture_cell(w, m, s, lo, hi)[1]])
@@ -336,13 +358,13 @@ def _lloyd_max_mixture_interval(w, m, s, lo, hi, num_pts, *, iters=1000, tol=1e-
     qs = np.clip(np.linspace(Plo, Phi_hi, num_pts + 1), 1e-15, 1 - 1e-15)
     e = mu + sd * ndtri(qs); e[0], e[-1] = lo, hi             # init: moment-matched-Gaussian quantiles
     for _ in range(iters):
-        v = np.array([_mixture_cell(w, m, s, e[i], e[i + 1])[1] for i in range(num_pts)])
+        v = _mixture_cells_vec(w, m, s, e)[1]
         ne = e.copy(); ne[1:-1] = 0.5 * (v[:-1] + v[1:])      # edges <- midpoints of mixture centroids
         if np.max(np.abs(ne[1:-1] - e[1:-1])) < tol:
             e = ne
             break
         e = ne
-    v = np.array([_mixture_cell(w, m, s, e[i], e[i + 1])[1] for i in range(num_pts)])
+    v = _mixture_cells_vec(w, m, s, e)[1]
     return e, v
 
 

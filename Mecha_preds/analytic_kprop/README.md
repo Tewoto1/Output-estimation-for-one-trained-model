@@ -41,12 +41,40 @@ Gaussian input is one component with within-component spike variance `t2 = 1`).
 with scalar weights, so the layer needs only **two aggregated congruences** (see
 `_covariance_sums`) — `O(1)·d³` per layer vs the binned method's `O(num_bins)·d³` —
 plus `O(m·J)` closed-form scalars and the shared `O(num_nodes·d²)` ReLU-kernel
-special functions. The advantage shows at larger widths (CPU crossover ≈ n ≳ 200);
-at small widths the fixed scalar machinery dominates and binned is faster.
+special functions. Fast-path engineering on top of the algorithm: the per-node
+Gaussian-ReLU loop is **threaded** (`workers`, same semantics/env override as
+binned, identical results), PSD of the affine family `Σ₀+yΣ₁` is certified by
+**two endpoint Cholesky factorizations** instead of per-node `eigh` (affine ⇒
+convex combination of the extreme nodes), the Lloyd-Max grid + pair stats are
+fully vectorized, and `device="cuda"` **torch-offloads** the Sigma-stack
+congruences (numpy fallback). Measured at matched budget 40, depth 2 (4-core CPU):
+n=256 **0.55s vs binned 3.3s**, n=512 **2.2s vs 12.6s**, n=1024 **8.7s vs ≫100s**.
 
 **Error budget** (paper thm 10.1): conditional K=2 closure + affine re-projection
 (residuals `E_m`, `E_S`, `tr R_m` logged per layer) + the 1-D quantization term
 (eq 134, logged as `scalar_distortion`) which the `num_nodes` knob controls.
+
+**`fit="post"` variant.** The affine family can instead be fitted to the
+**post-activation** slice functions, `B|A=a ⇝ N(m0+m1a, W0+W1a)` (`PostAffineState`).
+Linearity preserves affinity exactly, so the linear step reduces to transforming
+the four family objects (2–3 congruences `V·Vᵀ`, four matvecs) — the state carries
+**no per-node matrix stack at all** (memory `O(d²)` vs `O(num_nodes·d²)`), all
+cell-merged reconditioned moments live in a ≤7-vector basis with closed-form
+scalar coefficients, and the ReLU inputs are mixture covariances (PSD by
+construction — no eigen repair). This makes exactly the projection the paper's
+checklist item 7 avoids (the post-ReLU `r(a)` is nonlinear in `a`), i.e. it is a
+*different, lighter closure* — empirically at parity or slightly better at
+n=48–96, and faster + ~40× lighter in memory at n≥1024. The **zero atom** (the
+merge of *all* negative cells) is kept as a separate **exact** component by
+default (`atom="exact"`); `atom="fit"` folds it into the linearity hypothesis —
+a toggle to test which assumption is better.
+
+**Measured phase breakdown** (n=1024, depth 2, 40 nodes, 4-core box): the exact
+bivariate ReLU kernel is ~95% of runtime in both variants (`t_relu` 8.1s pre /
+4.8s post — post also wins time via less memory traffic); everything else
+(`t_params/grid/pairs/cells/fit/merge`, i.e. the whole linear+recondition+fit
+machinery) totals ~0.3–0.4s. Per-phase timings are logged in
+`stats["t_*"]` on every run.
 
 ## What's inside
 
@@ -75,9 +103,19 @@ layer — the hyperparameter; the §3 experiments show a knee at ~6–10, so 40 
 generous), `num_nodes_neg`/`num_nodes_pos` (sign-split override; default allocates
 by mixture mass), `grid` (`"w2"` Lloyd-Max on the exact mixture | `"uniform"`),
 `bulk_relu` (`"exact"` | `"gain"` | `"kprop"`), `cov_intercept` (`"mc"` | `"ls"`),
-`diagnostics` (adds the per-cell `E_S` residual; costs `J` congruences/layer).
+`diagnostics` (adds the per-cell `E_S` residual; costs `J` congruences/layer —
+torch-batched under `device`), `workers` (`"auto"` = parallel per-node ReLU, `1` =
+serial; identical results; env `BINNED_KPROP_WORKERS`), `device` (`None` = numpy;
+`"cuda"` = torch congruences, numpy fallback if unavailable).
 
-Experiments + validation: `colab_notebooks/analytic_kprop/` (MC references cached in
-`checkpoints/analytic_kprop/`, shared with `checkpoints/binned_kprop/` when configs
-match). Scalar-law variants of paper §7.3 (mixture-integral, atomic-node,
-single-Gaussian baseline) are future knobs.
+Experiments + validation: `experiments/analytic_kprop/` — the notebook
+(`analytic_kprop_colab.ipynb`) for cheap validation/diagnostics, and
+**`binning_scaling_experiment.py`** for the width-scaling law at A100 scale
+(widths up to 4096, 10 parallel seeds, split-half cross-MSE to beat the MC-noise
+floor; ARC-infra runnable via `c run [name] "experiments/analytic_kprop/
+binning_scaling_experiment.py" --run-name analytic-binning-scaling`, or locally
+with `--quick`). MC references cached in `checkpoints/analytic_kprop/`, shared
+with `checkpoints/binned_kprop/` when configs match; prediction vectors cached
+independently of the MC budget under `checkpoints/analytic_kprop/pred/`.
+Scalar-law variants of paper §7.3 (mixture-integral, atomic-node, single-Gaussian
+baseline) are future knobs.

@@ -124,6 +124,7 @@ no global registry):
 | `checkpoints/shifted_mean_vanilla_kprop/` | shifted-mean **vanilla-kprop scaling** notebook — random `W = W' − (1/√n)11ᵀ` models (`shifted-invsqrtn`, shift on **hidden** layers, **no training**), d3–5, widths 64–3072, seeds 1–2 + a per-config `results_*.pt` cache of MC/vanilla-kprop predictions (recycled, downloadable) |
 | `checkpoints/spike_kprop/` | **spike-kprop** notebook — random **O(1)-eigenvalue** spiked models `M = W' + θ vvᵀ` (θ=1, hidden layers, **no training**) in two directions `spike-e1` (localized) / `spike-ones` (flat), d3, widths 64–512, seeds 1–2 + a per-config `results_*.pt` cache (MC + ordinary-kprop + spike-kprop). Tests the trace-projection theorem: flat = resolvable, localized = needs spike-direction cumulants |
 | `checkpoints/neuron_activity_shifted/` | **neuron-activity** notebook — random shifted models `shift-{plain,big-sub,big-add,small-e1,small-ones}_d3_w*_seed*` (hidden shift `W'+B`, **no training**) + a `stats_*.pt` cache of per-neuron firing rate / mean activation / variance (per layer). Per-neuron **heat + variance heatmaps** and active-set consistency vs the trained-to-0 `kprop_checkpoints` (read-only). The analysis code is **inline in the notebook** (not a repo tool). Hypothesis: random = few-active-but-varying, trained = same neurons every time |
+| `checkpoints/analytic_kprop/` | **analytic-kprop** notebook + `experiments/analytic_kprop/binning_scaling_experiment.py` (A100 width-scaling, ARC-infra runnable) — random coordinate-spike models `M = W + e₁e₁ᵀ` (**no training**): `mc_*.npz` MC references (format shared with `checkpoints/binned_kprop/`), `mc2_*.npz` MC with split halves (cross-MSE), `pred/*.npz` cached prediction vectors (keyed by net+config, independent of the MC budget — re-scoreable), `pts/*.json` resumable scalar points |
 
 Checkpoints are self-describing `.pt` files: `model_config`, `state_dict`, `step`,
 `history`, `final_loss`, `train_config` (+ any `extra_meta`). Load with
@@ -144,8 +145,8 @@ see §6 of the frozen-readout notebook.
    `E.parse_ckpt_name` and add the folder to the table in §4 above.
 3. **New notebook?** Notebooks are *generated* from `build_*.py` scripts (edit the
    script, re-run it — keeps them reproducible & diffable). Start from
-   `colab_notebooks/noiseless_and_frozen_readout/build_frozen_readout_structure_notebook.py`,
-   the reference example. Builders share `colab_notebooks/_nb.py`
+   `experiments/noiseless_and_frozen_readout/build_frozen_readout_structure_notebook.py`,
+   the reference example. Builders share `experiments/_nb.py`
    (`NotebookBuilder` + the standard `BOOTSTRAP_CELL` repo-locator); don't re-define
    cell helpers or bootstrap code.
 4. **New reusable metric?** Put it in `analysis/Tools/` and export it from
@@ -156,7 +157,7 @@ see §6 of the frozen-readout notebook.
    splits the all-ones-special / transverse basis, is exact for linear layers and the
    rank-2 ReLU case (`config={"R": 2}` ≡ exact-K2), and `R=3`/`R=4` add the special-mode
    d3/d4 cumulants via an Edgeworth / Gram–Charlier reweight. Validation + usage:
-   `colab_notebooks/sw_kprop/`.
+   `experiments/sw_kprop/`.
 6. **A small O(1)-eigenvalue spike in *any* direction (localized `e1` or flat `ones`)?**
    Use SPIKE-KPROP: `from Mecha_preds.cumulants.spikekprop import run_spike_kprop` —
    `run_spike_kprop(model, spike_dir="e1"|"ones"|vector, config={"R": 4, "n_nodes": 61})`.
@@ -164,7 +165,7 @@ see §6 of the frozen-readout notebook.
    (`|θ| ≤ n^{o(1)}`), retaining the spike-direction cumulants `C(v,…,v)=κ_p(S)` to order
    `R` (the trace-projection terms). `spike_dir="ones"` reproduces swkprop. **Coordinate
    spikes (`e1`) need more Gauss–Hermite nodes** — the special mode is a ReLU input, so its
-   kink is integrated numerically. Validation + usage: `colab_notebooks/spike_kprop/`.
+   kink is integrated numerically. Validation + usage: `experiments/spike_kprop/`.
 
 ## 6. Gotchas
 

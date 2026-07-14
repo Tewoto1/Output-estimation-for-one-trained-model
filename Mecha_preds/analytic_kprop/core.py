@@ -52,22 +52,44 @@ the per-node bulk-ReLU backend dispatch from ``..binned_kprop.core``.
 """
 from __future__ import annotations
 
-import math
+import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import numpy as np
 
-from .._utils import _Phi, symmetrize, project_to_psd
+from .._utils import _Phi, _phi, symmetrize, project_to_psd
 from ..binned_kprop.binning import (
-    _DEFAULT_MIN_PROB, _VAR_FLOOR,
-    find_bin, normal_interval_stats, lloyd_max_edges_mixture_split,
+    _DEFAULT_MIN_PROB, _VAR_FLOOR, _xphi,
+    Workers, resolve_workers, _run_bins,
+    find_bin, lloyd_max_edges_mixture_split,
 )
 from ..binned_kprop.core import _bulk_relu_update
 
 # Coordinate of the spike (e = e_1 -> index 0 in Python). The bulk is coords 1..n-1.
 SPIKE_COORD = 0
 _TINY_VAR_Y = 1e-14          # v_Y below this -> slope unidentifiable, use mu1 = 0 (paper 6.1)
+
+
+def _torch_device(device):
+    """Resolve the optional torch device knob. ``None``/``"numpy"`` -> pure numpy.
+    A requested-but-unusable device (torch missing / CUDA unavailable) falls back to
+    numpy with a one-line warning rather than failing -- the numpy path is always
+    valid; torch only ACCELERATES the (m, d, d)-weighted congruences and batched
+    matmuls (see ``_weighted_sigma_congruence`` / ``percell_bulk_moments``)."""
+    if device in (None, "", "numpy"):
+        return None
+    try:
+        import torch
+    except ModuleNotFoundError:
+        print(f"analytic_kprop: device={device!r} requested but torch is not installed "
+              "-> numpy fallback")
+        return None
+    dev = torch.device(device)
+    if dev.type == "cuda" and not torch.cuda.is_available():
+        print("analytic_kprop: CUDA requested but unavailable -> numpy fallback")
+        return None
+    return dev
 
 
 # --------------------------------------------------------------------------- #
@@ -245,33 +267,64 @@ def _pair_stats(p, mY, sY2, edges, *, min_prob):
     ``Q[i,j] = P(Y_i in cell j)``, ``ymean[i,j] = E[Y | i, cell j]``,
     ``delta[i,j] = ymean - m_Y,i``, ``vv[i,j] = Var(Y | i, cell j)``.
     Deterministic components (``s2_Y,i < min_prob``) go wholly to their containing
-    cell (paper eq 73)."""
+    cell (paper eq 73).
+
+    Fully vectorized over the (component, cell) grid -- the same formulas as
+    ``normal_interval_stats`` (which is vectorized over cells only), broadcast as
+    (m_stoch, J) arrays; identical numbers, no per-component python loop."""
     m = p.shape[0]
     low, high = edges[:-1], edges[1:]
     J = low.shape[0]
     Q = np.zeros((m, J)); ymean = np.zeros((m, J))
     delta = np.zeros((m, J)); vv = np.zeros((m, J))
-    stoch = np.zeros(m, dtype=bool)
-    for i in range(m):
-        if p[i] <= 0.0:
-            continue
-        if sY2[i] < min_prob:                                   # deterministic branch
-            j = find_bin(edges, float(mY[i]))
-            Q[i, j] = 1.0; ymean[i, j] = mY[i]
-            continue
-        stoch[i] = True
-        Qi, ym, yv, t1, _t2 = normal_interval_stats(float(mY[i]), float(sY2[i]),
-                                                    low, high, min_prob=min_prob)
-        keep = Qi > min_prob
-        Q[i] = np.where(keep, Qi, 0.0)
-        ymean[i] = np.where(keep, ym, 0.0)
-        delta[i] = np.where(keep, t1, 0.0)
-        vv[i] = np.where(keep, yv, 0.0)
+    stoch = (p > 0.0) & (sY2 >= min_prob)
+    det = (p > 0.0) & ~stoch
+
+    if stoch.any():
+        mean = mY[stoch, None]                                  # (ms, 1)
+        var = sY2[stoch, None]
+        sig = np.sqrt(np.maximum(var, _VAR_FLOOR))
+        a = (low[None, :] - mean) / sig                         # (ms, J)
+        b = (high[None, :] - mean) / sig
+        phi_a, phi_b = _phi(a), _phi(b)
+        Qs = _Phi(b) - _Phi(a)
+        ok = Qs > min_prob
+        Qsafe = np.where(ok, Qs, 1.0)
+        tau1 = np.where(ok, sig * (phi_a - phi_b) / Qsafe, 0.0)
+        tau2 = np.where(ok, var * (1.0 + (_xphi(a, phi_a) - _xphi(b, phi_b)) / Qsafe), 0.0)
+        yv = np.clip(tau2 - tau1 * tau1, 0.0, None)
+        Q[stoch] = np.where(ok, Qs, 0.0)
+        ymean[stoch] = np.where(ok, mean + tau1, 0.0)
+        delta[stoch] = tau1
+        vv[stoch] = np.where(ok, yv, 0.0)
+
+    for i in np.nonzero(det)[0]:                                # deterministic branch (rare)
+        j = find_bin(edges, float(mY[i]))
+        Q[i, j] = 1.0; ymean[i, j] = mY[i]
     return Q, ymean, delta, vv, stoch
 
 
+def _weighted_sigma_congruence(V, Sigma, coeff_list, dev=None):
+    """``[V (sum_i c_i S_i) V^T  for c in coeff_list]`` -- the only O(d^3)+O(m d^2)
+    work in the affine fit. numpy by default; with a torch ``dev`` the Sigma stack is
+    uploaded ONCE and the weighted reduction + congruence run on the device (the win
+    at large d, especially on GPU)."""
+    if dev is None:
+        return [V @ np.einsum("i,iab->ab", c, Sigma, optimize=True) @ V.T
+                for c in coeff_list]
+    import torch
+    Sig_t = torch.as_tensor(Sigma, device=dev)
+    V_t = torch.as_tensor(V, device=dev)
+    out = []
+    for c in coeff_list:
+        c_t = torch.as_tensor(np.ascontiguousarray(c), device=dev)
+        Sagg = torch.tensordot(c_t, Sig_t, dims=1)                       # (d, d)
+        out.append((V_t @ Sagg @ V_t.T).cpu().numpy())
+    return out
+
+
 def _covariance_sums(p, Q, delta, vv, sY2, stoch, y, w, mhat,
-                     Sigma, t2, mC, g, u, V):
+                     Sigma, t2, mC, g, u, V, dev=None):
     """The two grid-weighted covariance sums the affine fit needs (paper eq 87),
 
         T0 = sum_j w_j Shat_j,      T1 = sum_j w_j y_j Shat_j,
@@ -282,7 +335,8 @@ def _covariance_sums(p, Q, delta, vv, sY2, stoch, y, w, mhat,
 
       * ``S_C,i``-part: scalar weights ``sum_j Q_ij c_j`` -> aggregate ``S_i``/``t2_i``
         first, then ONE congruence ``V (sum_i . S_i) V^T`` per sum  (the complexity
-        win over the binned companion's per-bin congruences);
+        win over the binned companion's per-bin congruences; torch-offloadable via
+        ``dev``);
       * rank-1 ``g_i g_i^T`` part: scalar weights ``sum_j Q_ij c_j (v_ij - s2_i)/s2_i^2``;
       * between-mean part: ``m_{i->j} = m_C,i + u_reg,i delta_ij`` is affine in the
         scalar ``delta``, so second moments reduce to the scalar sums
@@ -294,13 +348,15 @@ def _covariance_sums(p, Q, delta, vv, sY2, stoch, y, w, mhat,
     u_reg = np.where(stoch[:, None], g / s2[:, None], 0.0)              # (m, d)
     gcoef = np.where(stoch[:, None], 1.0, 0.0) * g                      # g zeroed if det
 
+    scales = (np.ones_like(y), y)
+    cqs = [(Q * c[None, :]).sum(axis=1) for c in scales]                # sum_j Q c_j
+    congr = _weighted_sigma_congruence(V, Sigma, [p * cq for cq in cqs], dev)
+
     out = []
-    for cell_scale in (np.ones_like(y), y):
+    for cell_scale, cq, VSV in zip(scales, cqs, congr):
         Qc = Q * cell_scale[None, :]                                    # (m, J)
-        cq = Qc.sum(axis=1)                                             # sum_j Q c_j
         # S_C part: V (sum_i p_i cq_i S_i) V^T + (sum_i p_i cq_i t2_i) u u^T
-        Sagg = np.einsum("i,iab->ab", p * cq, Sigma, optimize=True)
-        SC = V @ Sagg @ V.T + float(np.sum(p * cq * t2)) * np.outer(u, u)
+        SC = VSV + float(np.sum(p * cq * t2)) * np.outer(u, u)
         # rank-1 g g^T part: coefficient sum_j Q c_j (v - s2)/s2^2  (stochastic only)
         hv = (Qc * (vv - s2[:, None])).sum(axis=1) / (s2 * s2)
         hv = np.where(stoch, hv, 0.0)
@@ -318,10 +374,12 @@ def _covariance_sums(p, Q, delta, vv, sY2, stoch, y, w, mhat,
     return out[0], out[1]
 
 
-def percell_bulk_moments(p, Q, delta, vv, sY2, stoch, w, Sigma, t2, mC, g, u, V):
+def percell_bulk_moments(p, Q, delta, vv, sY2, stoch, w, Sigma, t2, mC, g, u, V,
+                         dev=None):
     """REFERENCE / diagnostics path: the per-cell merged moments ``(mhat_j, Shat_j)``
     (paper eqs 71-72), forming J d x d matrices (J congruences via the aggregated
-    ``A_j = sum_i eta_{i|j} S_i``). Used by the selftest to validate
+    ``A_j = sum_i eta_{i|j} S_i``; batched on torch ``dev`` when given -- this is the
+    costliest diagnostics step at large d). Used by the selftest to validate
     ``_covariance_sums`` and by ``diagnostics=True`` for the E_S residual."""
     m, J = Q.shape
     PQ = p[:, None] * Q                                                 # (m, J)
@@ -332,9 +390,17 @@ def percell_bulk_moments(p, Q, delta, vv, sY2, stoch, w, Sigma, t2, mC, g, u, V)
     # mhat_j = sum_i eta_ij (mC_i + u_reg_i delta_ij)
     mhat = eta.T @ m_ij_0 + (eta * delta).T @ u_reg                      # (J, d)
     # Shat_j = sum_i eta [S_C,i + g g^T (v-s2)/s2^2 + (m_ij - mhat_j)(...)^T]
-    Aj = np.einsum("ij,iab->jab", eta, Sigma, optimize=True)             # (J, d, d)
+    if dev is not None:
+        import torch
+        Sig_t = torch.as_tensor(Sigma, device=dev)
+        V_t = torch.as_tensor(V, device=dev)
+        eta_t = torch.as_tensor(eta, device=dev)
+        Aj_t = torch.tensordot(eta_t.T, Sig_t.reshape(m, -1), dims=1).reshape(J, *Sigma.shape[1:])
+        Shat = (V_t @ Aj_t @ V_t.T).cpu().numpy()                        # (J, d, d) on device
+    else:
+        Aj = np.einsum("ij,iab->jab", eta, Sigma, optimize=True)         # (J, d, d)
+        Shat = V @ Aj @ V.T                                              # batched congruence (BLAS)
     t2j = eta.T @ t2                                                     # (J,)
-    Shat = V @ Aj @ V.T                                                  # batched congruence (BLAS)
     Shat += t2j[:, None, None] * np.outer(u, u)[None, :, :]
     hv = np.where(stoch[:, None], (vv - s2[:, None]) / (s2 * s2)[:, None], 0.0)  # (m, J)
     gz = np.where(stoch[:, None], g, 0.0)
@@ -345,12 +411,24 @@ def percell_bulk_moments(p, Q, delta, vv, sY2, stoch, w, Sigma, t2, mC, g, u, V)
     return mhat, 0.5 * (Shat + np.swapaxes(Shat, 1, 2))
 
 
+def _chol_ok(S: np.ndarray) -> bool:
+    """Cheap PSD test: Cholesky succeeds (strictly PD up to roundoff). ~3-6x faster
+    than ``eigh``; a PSD-singular matrix may fail and simply falls through to the
+    exact ``project_to_psd`` path, which then clips nothing."""
+    try:
+        np.linalg.cholesky(S)
+        return True
+    except np.linalg.LinAlgError:
+        return False
+
+
 def analytic_layer_update(state: AnalyticState, M: np.ndarray, b: Optional[np.ndarray],
                           *, num_nodes: int, num_nodes_neg: Optional[int] = None,
                           num_nodes_pos: Optional[int] = None, grid: str = "w2",
                           bulk_relu: str = "exact", cov_intercept: str = "mc",
                           min_prob: float = _DEFAULT_MIN_PROB,
                           diagnostics: bool = False,
+                          workers: Workers = None, dev=None,
                           stats: Optional[dict] = None
                           ) -> Tuple[AnalyticState, AffineState]:
     """One hidden layer of Algorithm 7.2: linear + Bayesian reconditioning on the new
@@ -359,23 +437,44 @@ def analytic_layer_update(state: AnalyticState, M: np.ndarray, b: Optional[np.nd
 
     ``cov_intercept``: "mc" (default) adds the moment-conservative correction
     ``Sigma0 += R_m`` (paper eq 90), which preserves the unconditional bulk
-    covariance; "ls" keeps the literal least-squares intercept (eq 87)."""
+    covariance; "ls" keeps the literal least-squares intercept (eq 87).
+
+    ``workers``: thread count for the independent per-node Gaussian-ReLU updates
+    (the dominant cost with the exact bivariate backend -- scipy's special-function
+    ufuncs and LAPACK release the GIL, exactly like the binned companion's per-bin
+    loops). ``None``/``"auto"`` auto-resolves per machine (``resolve_workers``,
+    shared with binned; env override ``$BINNED_KPROP_WORKERS``); pass ``1`` for
+    serial. Results are identical to serial regardless of the count.
+
+    ``dev``: resolved torch device (see ``_torch_device``) or ``None``; offloads the
+    Sigma-stack reductions + congruences (and the diagnostics batch congruence)."""
     if cov_intercept not in ("mc", "ls"):
         raise ValueError(f"cov_intercept must be 'mc' or 'ls', got {cov_intercept!r}")
     d = state.d
     p_in = state.p
+    _tick = time.perf_counter
+    _t = _tick()
+
+    def _phase(name, t0):
+        if stats is not None:
+            stats.setdefault(f"t_{name}", []).append(_tick() - t0)
+        return _tick()
+
     gamma, r, u, V, beta, eta_b = _layer_block(M, b, d)
 
     # ---- components of the scalar mixture + conditional bulk (eqs 60-61, 51) ----
     mY, sY2, mC, g = _component_params(state, gamma, r, u, V, beta, eta_b)
+    _t = _phase("params", _t)
 
     # ---- signed cell grid with an edge at 0 (checklist 2) ----
     n_neg, n_pos = split_node_budget(num_nodes, negative_mass(p_in, mY, sY2),
                                      num_nodes_neg, num_nodes_pos)
     edges = make_cells(p_in, mY, sY2, n_neg, n_pos, grid=grid)
+    _t = _phase("grid", _t)
 
     # ---- per-(component, cell) closed-form stats (eqs 63-66) ----
     Q, ymean, delta, vv, stoch = _pair_stats(p_in, mY, sY2, edges, min_prob=min_prob)
+    _t = _phase("pairs", _t)
 
     w_raw = p_in @ Q                                                   # (J,)
     W_tot = float(w_raw.sum())
@@ -408,8 +507,9 @@ def analytic_layer_update(state: AnalyticState, M: np.ndarray, b: Optional[np.nd
     E_m = float(w @ (e_m * e_m).sum(axis=1))
     R_m = np.einsum("j,ja,jb->ab", w, e_m, e_m, optimize=True)                        # eq 88
 
+    _t = _phase("cells", _t)
     T0, T1 = _covariance_sums(p_in, Q, delta, vv, sY2, stoch, y, w_raw, mhat,
-                              state.Sigma, state.t2, mC, g, u, V)
+                              state.Sigma, state.t2, mC, g, u, V, dev)
     T0 /= W_tot; T1 /= W_tot
     if vY > _TINY_VAR_Y:
         Sigma1 = symmetrize((T1 - ybar * T0) / vY)
@@ -419,23 +519,38 @@ def analytic_layer_update(state: AnalyticState, M: np.ndarray, b: Optional[np.nd
     if cov_intercept == "mc":
         Sigma0 = symmetrize(Sigma0 + R_m)                              # eq 90
 
+    _t = _phase("fit", _t)
     E_S = float("nan")
     if diagnostics:
         _mh_ref, Shat = percell_bulk_moments(p_in, Q, delta, vv, sY2, stoch, w_raw,
-                                             state.Sigma, state.t2, mC, g, u, V)
+                                             state.Sigma, state.t2, mC, g, u, V, dev)
         resid = Shat - Sigma0[None] - y[:, None, None] * Sigma1[None] \
             + (R_m[None] if cov_intercept == "mc" else 0.0)            # E_S is vs the LS fit (eq 83)
         E_S = float(np.einsum("j,jab,jab->", w, resid, resid, optimize=True))
+    _t = _phase("diag", _t)
 
     # ---- slice-wise exact Gaussian-ReLU at every retained node (eqs 98-99) ----
+    # PSD screen first: Sigma(y) = Sigma0 + y Sigma1 is AFFINE in y, so any interior
+    # node is a convex combination of the two EXTREME nodes -- if those are PSD, all
+    # are (constraint eq 93 holds grid-wide). Two Cholesky factorizations thus replace
+    # J eigendecompositions in the common case; only Cholesky-failing nodes eigen-clip.
     J = y.shape[0]
+    all_psd = (_chol_ok(symmetrize(Sigma0 + float(y.min()) * Sigma1))
+               and _chol_ok(symmetrize(Sigma0 + float(y.max()) * Sigma1)))
     r_nodes = np.zeros((J, d)); R_nodes = np.zeros((J, d, d))
-    psd_clipped = 0.0
-    for j in range(J):
+
+    def _node(j):
+        """Independent per-node work (threads write disjoint rows j; the clip mass is
+        RETURNED and summed by the caller -- a shared ``+=`` would race)."""
         Sj = symmetrize(Sigma0 + y[j] * Sigma1)
-        Sj, c = project_to_psd(Sj)                                     # constraint eq 93
-        psd_clipped += c
+        c = 0.0
+        if not (all_psd or _chol_ok(Sj)):
+            Sj, c = project_to_psd(Sj)                                 # eigen-clip + log (eq 93)
         r_nodes[j], R_nodes[j] = _bulk_relu_update(mu0 + y[j] * mu1, Sj, bulk_relu)
+        return c
+
+    psd_clipped = float(sum(_run_bins(J, _node, workers)))
+    _t = _phase("relu", _t)
 
     # ---- spike ReLU: keep positive nodes (eq 39), merge the rest (eqs 40-42) ----
     pos = y > 0.0
@@ -457,6 +572,7 @@ def analytic_layer_update(state: AnalyticState, M: np.ndarray, b: Optional[np.nd
         mu=np.concatenate(parts_m, axis=0),
         Sigma=np.concatenate(parts_S, axis=0))
 
+    _t = _phase("merge", _t)
     # ---- layer logs (checklist 9) ----
     if stats is not None:
         distortion = float((PQ * ((ymean - y[None, :]) ** 2 + vv)).sum() / W_tot)  # eq 134
@@ -516,7 +632,10 @@ def run_analytic_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]]
                           grid: str = "w2", bulk_relu: str = "exact",
                           cov_intercept: str = "mc", input_std: float = 1.0,
                           min_prob: float = _DEFAULT_MIN_PROB,
-                          diagnostics: bool = False, collect: bool = False) -> dict:
+                          fit: str = "pre", atom: str = "exact",
+                          diagnostics: bool = False,
+                          workers: Workers = None, device: Optional[str] = None,
+                          collect: bool = False) -> dict:
     """Predict ``E[f(X)]`` for ``X ~ N(0, input_std^2 I)`` by ANALYTIC AFFINE K=2
     propagation along the coordinate spike ``e = e_1`` (Algorithm 7.2).
 
@@ -528,37 +647,68 @@ def run_analytic_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]]
     between layers is ONE affine family (2 vectors + 2 matrices), so the per-layer
     congruence cost is O(1), not O(num_nodes) -- see module docstring.
 
+    ``workers`` threads the per-node Gaussian-ReLU loop exactly like the binned
+    companion (``None``/``"auto"`` = auto-parallel per machine, ``1`` = serial;
+    results identical either way; env override ``$BINNED_KPROP_WORKERS``).
+    ``device`` (e.g. ``"cuda"``) offloads the Sigma-stack reductions/congruences
+    (and the ``diagnostics`` batch congruence) to torch; falls back to numpy with a
+    warning if torch/CUDA is unavailable. The exact bivariate ReLU kernel stays on
+    CPU (scipy special functions) -- threading is what accelerates it.
+
+    ``fit`` selects WHERE the affine projection is applied: "pre" (paper Algorithm
+    7.2 -- fit the reconditioned pre-activation, keep exact nonlinear post-ReLU
+    node moments) or "post" (fit the POST-ReLU slice functions; the linear step
+    then just transforms (m0, m1, W0, W1) -- no per-node matrix state, memory
+    O(d^2); see the PostAffineState section). ``atom`` ("post" only): "exact"
+    keeps the zero atom (the merge of ALL negative cells) as a separate exact
+    component; "fit" folds it into the affine family -- a toggle to test whether
+    the linearity assumption may include the atom.
+
     Returns ``{"mean", "metadata", ...}``; ``collect`` adds per-layer affine states,
     the spike law by layer, the final state, and the raw stats lists.
     """
     if num_nodes < 2:
         raise ValueError("num_nodes must be >= 2 (need >= 1 cell on each side of 0)")
+    if fit not in ("pre", "post"):
+        raise ValueError(f"fit must be 'pre' or 'post', got {fit!r}")
     n_hidden = len(weights) - 1
     if n_hidden < 1:
         raise ValueError("need at least one hidden layer + a readout")
     d = input_dim - 1
+    dev = _torch_device(device)
 
     stats: dict = {}
-    state = gaussian_input_state(d, input_std=input_std)
     affines = []; spike_by_layer = []
+    state = (gaussian_input_state_post(d, input_std=input_std) if fit == "post"
+             else gaussian_input_state(d, input_std=input_std))
     for li in range(n_hidden):
         W, b = weights[li]
         M = np.asarray(W, dtype=np.float64)
         if M.shape != (input_dim, input_dim):
             raise ValueError(f"hidden layer {li} must be square ({input_dim},{input_dim}); "
                              f"got {M.shape}")
-        state, aff = analytic_layer_update(
-            state, M, b, num_nodes=num_nodes, num_nodes_neg=num_nodes_neg,
-            num_nodes_pos=num_nodes_pos, grid=grid, bulk_relu=bulk_relu,
-            cov_intercept=cov_intercept, min_prob=min_prob,
-            diagnostics=diagnostics, stats=stats)
+        if fit == "post":
+            state = analytic_layer_update_post(
+                state, M, b, num_nodes=num_nodes, num_nodes_neg=num_nodes_neg,
+                num_nodes_pos=num_nodes_pos, grid=grid, bulk_relu=bulk_relu,
+                cov_intercept=cov_intercept, atom=atom, min_prob=min_prob,
+                workers=workers, dev=dev, stats=stats)
+            aff = state                                     # the state IS the family
+        else:
+            state, aff = analytic_layer_update(
+                state, M, b, num_nodes=num_nodes, num_nodes_neg=num_nodes_neg,
+                num_nodes_pos=num_nodes_pos, grid=grid, bulk_relu=bulk_relu,
+                cov_intercept=cov_intercept, min_prob=min_prob,
+                diagnostics=diagnostics, workers=workers, dev=dev, stats=stats)
         if collect:
             affines.append(aff)
             spike_by_layer.append(dict(layer=li, p=state.p.copy(), a=state.a.copy()))
 
     W_ro, b_ro = weights[-1]
     W_ro = np.asarray(W_ro, dtype=np.float64)
-    mean = W_ro @ unconditional_mean(state)                            # eq 126
+    full_mean = (unconditional_mean_post(state) if fit == "post"
+                 else unconditional_mean(state))
+    mean = W_ro @ full_mean                                            # eq 126
     if b_ro is not None:
         mean = mean + np.asarray(b_ro, dtype=np.float64)
 
@@ -570,7 +720,10 @@ def run_analytic_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]]
         "metadata": {
             "predictor": "analytic_kprop_k2", "K": 2,
             "num_nodes": int(num_nodes), "grid": grid,
+            "fit": fit, "atom": (atom if fit == "post" else None),
             "bulk_relu": bulk_relu, "cov_intercept": cov_intercept,
+            "workers": resolve_workers(workers),
+            "device": ("numpy" if dev is None else str(dev)),
             "n_hidden": n_hidden, "input_dim": int(input_dim),
             "output_dim": int(np.asarray(mean).reshape(-1).shape[0]),
             "max_mass_lost": _mx("mass_lost"),
@@ -588,4 +741,348 @@ def run_analytic_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]]
         out["spike_by_layer"] = spike_by_layer
         out["final_state"] = state
         out["stats"] = stats
+    return out
+
+
+# =========================================================================== #
+# POST-ACTIVATION AFFINE VARIANT (fit="post")
+#
+# The affine family is fitted to the POST-ReLU slice functions instead of the
+# reconditioned pre-activation:
+#
+#     B | A = a  ~~>  N(m0 + m1 a,  W0 + W1 a)          (positive branch)
+#
+# with the ZERO ATOM either kept as a separate EXACT component (atom="exact",
+# default -- the atom is the merge of ALL negative cells, so assuming it obeys
+# the same linearity is a genuinely different hypothesis) or folded into the
+# fit (atom="fit"; toggle to test which assumption is better).
+#
+# Why: linear maps preserve affinity EXACTLY, so the linear step reduces to
+# transforming the four family objects (m0, m1, W0, W1) -- two congruences
+# V W V^T + four matvecs -- instead of transforming per-node moments. The state
+# carries NO (num_nodes, d, d) stack (memory O(d^2), not O(num_nodes d^2)); the
+# exact-cell reconditioning survives because every within-component quantity is
+# affine in the node value a_i, so all cell-merged moments live in a <=7-vector
+# basis with closed-form scalar coefficients. The ReLU step is unchanged (exact
+# Gaussian integrals per retained node, O(num_nodes d^2) special functions) and
+# its inputs Shat_j are mixture covariances -- PSD by construction, so the
+# affine-family PSD obstruction never reaches the kernel (a cheap Cholesky
+# guard remains for roundoff).
+#
+# Approximation ordering vs fit="pre": the paper (checklist 7) deliberately
+# avoids fitting the positive post-ReLU functions because r(a) = m_rho(...) is
+# nonlinear in a; this variant makes exactly that extra projection and is
+# therefore a (cheaper, lighter) DIFFERENT closure -- compare empirically.
+# =========================================================================== #
+@dataclass
+class PostAffineState:
+    """Post-ReLU state for fit="post": node law (p, a) + affine bulk family
+    (m0, m1, W0, W1) on the positive branch + optional EXACT zero atom.
+
+    p, a:    (K,) node probabilities / spike values (node 0 = atom when exact)
+    m0, m1:  (d,)  affine conditional mean  E[B|A=a] ~ m0 + m1 a   (a > 0)
+    W0, W1:  (d,d) affine conditional cov   Cov[B|A=a] ~ W0 + W1 a (a > 0)
+    atom_m/atom_S: exact zero-atom bulk moments (None -> atom uses the family)
+    t2:      (K,) within-component spike variance (input layer only)
+    """
+    p: np.ndarray
+    a: np.ndarray
+    m0: np.ndarray
+    m1: np.ndarray
+    W0: np.ndarray
+    W1: np.ndarray
+    atom_m: Optional[np.ndarray] = None
+    atom_S: Optional[np.ndarray] = None
+    t2: np.ndarray = field(default=None)  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.t2 is None:
+            self.t2 = np.zeros_like(self.a)
+
+    @property
+    def num_nodes(self) -> int:
+        return self.p.shape[0]
+
+    @property
+    def d(self) -> int:
+        return self.m0.shape[0]
+
+
+def gaussian_input_state_post(d: int, *, input_std: float = 1.0) -> PostAffineState:
+    """Exact input state ``X ~ N(0, s^2 I)`` in post-affine form: one component
+    (a=0, t2=s^2), constant family m(a)=0, S(a)=s^2 I, no atom."""
+    s2 = float(input_std) ** 2
+    return PostAffineState(p=np.array([1.0]), a=np.array([0.0]),
+                           m0=np.zeros(d), m1=np.zeros(d),
+                           W0=s2 * np.eye(d), W1=np.zeros((d, d)),
+                           t2=np.array([s2]))
+
+
+def _congr(V: np.ndarray, S: np.ndarray, dev=None) -> np.ndarray:
+    """V S V^T, torch-offloadable."""
+    if dev is None:
+        return V @ S @ V.T
+    import torch
+    V_t = torch.as_tensor(V, device=dev)
+    return (V_t @ torch.as_tensor(S, device=dev) @ V_t.T).cpu().numpy()
+
+
+def analytic_layer_update_post(state: PostAffineState, M: np.ndarray,
+                               b: Optional[np.ndarray], *, num_nodes: int,
+                               num_nodes_neg: Optional[int] = None,
+                               num_nodes_pos: Optional[int] = None,
+                               grid: str = "w2", bulk_relu: str = "exact",
+                               cov_intercept: str = "mc", atom: str = "exact",
+                               min_prob: float = _DEFAULT_MIN_PROB,
+                               workers: Workers = None, dev=None,
+                               stats: Optional[dict] = None
+                               ) -> PostAffineState:
+    """One hidden layer of the POST-fit variant (see the section banner):
+    transform the affine family through the linear map (2-3 congruences), exact
+    cell reconditioning in a 7-vector basis, exact Gaussian-ReLU per node with
+    streaming covariance accumulators (no (J, d, d) storage), zero-atom merge,
+    then the post-ReLU weighted-LS fit of (m0, m1, W0, W1)."""
+    if cov_intercept not in ("mc", "ls"):
+        raise ValueError(f"cov_intercept must be 'mc' or 'ls', got {cov_intercept!r}")
+    if atom not in ("exact", "fit"):
+        raise ValueError(f"atom must be 'exact' or 'fit', got {atom!r}")
+    d = state.d
+    p_in, a_in, t2 = state.p, state.a, state.t2
+    K = p_in.shape[0]
+    has_atom = state.atom_m is not None
+    atom_idx = 0 if has_atom else -1                     # exact-atom component index
+    _tick = time.perf_counter
+    _t = _tick()
+
+    def _phase(name, t0):
+        if stats is not None:
+            stats.setdefault(f"t_{name}", []).append(_tick() - t0)
+        return _tick()
+
+    gamma, r, u, V, beta, eta_b = _layer_block(M, b, d)
+
+    # ---- transform the family: the whole "linear step" (2-3 congruences) ----
+    c0 = V @ state.m0 + eta_b
+    c1 = u + V @ state.m1
+    g0 = V @ (state.W0 @ r)
+    g1 = V @ (state.W1 @ r)
+    s0 = float(r @ (state.W0 @ r))
+    s1 = float(r @ (state.W1 @ r))
+    G0 = _congr(V, state.W0, dev)
+    G1 = _congr(V, state.W1, dev)
+    if has_atom:
+        mC_at = V @ state.atom_m + eta_b
+        g_at = V @ (state.atom_S @ r)
+        s_at = float(r @ (state.atom_S @ r))
+        G_at = _congr(V, state.atom_S, dev)
+    else:
+        mC_at = np.zeros(d); g_at = np.zeros(d); s_at = 0.0; G_at = None
+
+    nonat = np.ones(K, dtype=bool)
+    if has_atom:
+        nonat[atom_idx] = False
+    mY = np.where(nonat, beta + float(r @ state.m0) + (gamma + float(r @ state.m1)) * a_in,
+                  beta + float(r @ (state.atom_m if has_atom else state.m0)))
+    sY2 = np.where(nonat, s0 + s1 * a_in + gamma * gamma * t2, s_at)
+    sY2 = np.clip(sY2, 0.0, None)
+    _t = _phase("params", _t)
+
+    # ---- grid + closed-form pair stats (same machinery as fit="pre") ----
+    n_neg, n_pos = split_node_budget(num_nodes, negative_mass(p_in, mY, sY2),
+                                     num_nodes_neg, num_nodes_pos)
+    edges = make_cells(p_in, mY, sY2, n_neg, n_pos, grid=grid)
+    _t = _phase("grid", _t)
+    Q, ymean, delta, vv, stoch = _pair_stats(p_in, mY, sY2, edges, min_prob=min_prob)
+    _t = _phase("pairs", _t)
+
+    w_raw = p_in @ Q
+    W_tot = float(w_raw.sum())
+    if W_tot <= 0.0:
+        raise RuntimeError("all scalar mass vanished in analytic_layer_update_post")
+    retained = w_raw > min_prob
+    Q = Q[:, retained]; ymean = ymean[:, retained]
+    delta = delta[:, retained]; vv = vv[:, retained]
+    w_raw = w_raw[retained]
+    J = w_raw.shape[0]
+    PQ = p_in[:, None] * Q
+    eta = PQ / w_raw[None, :]
+    y = (PQ * ymean).sum(axis=0) / w_raw
+    w = w_raw / W_tot
+
+    # ---- everything in the 7-vector basis (all component moments are affine) ----
+    # columns: 0 c0 | 1 c1 | 2 mC_atom | 3 g0/s^2 dir | 4 g1 dir | 5 g_atom dir | 6 u
+    Bmat = np.stack([c0, c1, mC_at, g0, g1, g_at, u], axis=1)          # (d, 7)
+    s2 = np.where(stoch, sY2, 1.0)
+    inv_s2 = np.where(stoch, 1.0 / s2, 0.0)
+    wc = np.zeros((K, J, 7))
+    dl = delta * inv_s2[:, None]                                       # delta / s^2
+    na = nonat
+    wc[na, :, 0] = 1.0
+    wc[na, :, 1] = a_in[na, None]
+    wc[na, :, 3] = dl[na]
+    wc[na, :, 4] = a_in[na, None] * dl[na]
+    wc[na, :, 6] = (gamma * t2)[na, None] * dl[na]
+    if has_atom:
+        wc[atom_idx, :, 2] = 1.0
+        wc[atom_idx, :, 5] = dl[atom_idx]
+    # g-direction coords (for the rank-1 v-correction g_i g_i^T (v - s^2)/s^4)
+    gc = np.zeros((K, 7))
+    gc[na, 3] = 1.0; gc[na, 4] = a_in[na]; gc[na, 6] = (gamma * t2)[na]
+    if has_atom:
+        gc[atom_idx, 5] = 1.0
+
+    wbar = np.einsum("ij,ijk->jk", eta, wc, optimize=True)             # (J, 7)
+    dw = wc - wbar[None, :, :]
+    Cm = np.einsum("ij,ijk,ijl->jkl", eta, dw, dw, optimize=True)      # between-mean part
+    hv = np.where(stoch[:, None], (vv - s2[:, None]) * (inv_s2 * inv_s2)[:, None], 0.0)
+    Cg = np.einsum("ij,ik,il->jkl", eta * hv, gc, gc, optimize=True)   # v-correction part
+    C = Cm + Cg
+    # S_C scalar coefficients: G0 + a G1 (+ t2 u u^T) per non-atom comp, G_at for atom
+    alpha = eta[na].sum(axis=0)
+    beta_c = (eta[na] * a_in[na, None]).sum(axis=0)
+    omega = eta[atom_idx] if has_atom else np.zeros(J)
+    C[:, 6, 6] += (eta * t2[:, None]).sum(axis=0)                      # t2 u u^T
+    mhat = wbar @ Bmat.T                                               # (J, d)
+    _t = _phase("cells", _t)
+
+    # ---- exact Gaussian-ReLU per retained node, STREAMING accumulators ----
+    # Slot-threaded: worker slot k owns nodes j = k (mod n_slots) and accumulates
+    # into ITS OWN (d, d) partials -- no per-chunk synchronization bubbles, no
+    # (J, d, d) storage (memory O(n_slots d^2)). The final slot-sum runs in fixed
+    # order, so results are deterministic for a given worker count (fp-identical
+    # to serial only at workers=1 -- the addition grouping differs otherwise).
+    pos = y > 0.0
+    r_nodes = np.zeros((J, d))
+    n_slots = max(1, min(resolve_workers(workers), J))
+    AR_pos_s = np.zeros((n_slots, d, d)); AyR_pos_s = np.zeros((n_slots, d, d))
+    AR_neg_s = np.zeros((n_slots, d, d))
+    R2_s = np.zeros(n_slots); clip_s = np.zeros(n_slots)
+
+    def _slot(k):
+        for j in range(k, J, n_slots):
+            Sj = alpha[j] * G0 + beta_c[j] * G1 + Bmat @ C[j] @ Bmat.T
+            if G_at is not None:
+                Sj += omega[j] * G_at
+            Sj = symmetrize(Sj)
+            # Shat_j is a MIXTURE covariance -> PSD by construction; only roundoff
+            # can violate it, and the exact kernel is defensive (rho/variance
+            # clipping), so a diagonal floor replaces a per-node factorization.
+            dg = np.einsum("aa->a", Sj)
+            neg = float(dg.min())
+            if neg < 0.0:
+                clip_s[k] += -neg
+                np.clip(dg, 0.0, None, out=dg)
+            rj, Rj = _bulk_relu_update(mhat[j], Sj, bulk_relu)
+            r_nodes[j] = rj
+            if pos[j]:
+                AR_pos_s[k] += w[j] * Rj
+                AyR_pos_s[k] += (w[j] * y[j]) * Rj
+                R2_s[k] += w[j] * float(np.einsum("ab,ab->", Rj, Rj))
+            else:
+                AR_neg_s[k] += w[j] * Rj
+
+    _run_bins(n_slots, _slot, workers)
+    AR_pos = AR_pos_s.sum(axis=0); AyR_pos = AyR_pos_s.sum(axis=0)
+    AR_neg = AR_neg_s.sum(axis=0)
+    R2_pos = float(R2_s.sum()); psd_clipped = float(clip_s.sum())
+    _t = _phase("relu", _t)
+
+    # ---- zero atom: exact merge of all nonpositive nodes (eqs 40-42) ----
+    p0 = float(w[~pos].sum())
+    if p0 > 0.0:
+        wz = w[~pos] / p0
+        m_at_new = wz @ r_nodes[~pos]
+        dm = r_nodes[~pos] - m_at_new[None, :]
+        S_at_new = symmetrize(AR_neg / p0 + np.einsum("j,ja,jb->ab", wz, dm, dm,
+                                                      optimize=True))
+    else:
+        m_at_new = None; S_at_new = None
+    _t = _phase("merge", _t)
+
+    # ---- POST-ReLU affine fit (this variant's defining projection) ----
+    # data: positive nodes (y_j, r_j, R_j-accumulators); atom="fit" adds the merged
+    # atom as a data point at a=0 (folding the all-negative-cells merge into the
+    # linearity hypothesis); atom="exact" keeps it out as an exact component.
+    fit_w = list(w[pos]); fit_a = list(y[pos])
+    fit_r = [r_nodes[pos]]
+    AR_f = AR_pos.copy(); AyR_f = AyR_pos.copy()
+    if atom == "fit" and p0 > 0.0:
+        fit_w.append(p0); fit_a.append(0.0)
+        fit_r.append(m_at_new[None, :])
+        AR_f += p0 * S_at_new
+    fit_w = np.asarray(fit_w); fit_a = np.asarray(fit_a)
+    fit_r = np.concatenate(fit_r, axis=0)
+    mass_f = float(fit_w.sum())
+    E_m_post = float("nan"); E_S_post = float("nan")
+    if mass_f > 0.0 and fit_w.size > 0:
+        fw = fit_w / mass_f
+        AR_f /= mass_f; AyR_f /= mass_f
+        abar = float(fw @ fit_a)
+        va = float(fw @ (fit_a - abar) ** 2)
+        if va > _TINY_VAR_Y:
+            m1_new = ((fw * (fit_a - abar))[:, None] * fit_r).sum(axis=0) / va
+            W1_new = symmetrize((AyR_f - abar * AR_f) / va)
+        else:
+            m1_new = np.zeros(d); W1_new = np.zeros((d, d))
+        m0_new = (fw[:, None] * fit_r).sum(axis=0) - m1_new * abar
+        W0_new = symmetrize(AR_f - abar * W1_new)
+        e_m = fit_r - m0_new[None, :] - fit_a[:, None] * m1_new[None, :]
+        E_m_post = float(fw @ (e_m * e_m).sum(axis=1))
+        R_m = np.einsum("j,ja,jb->ab", fw, e_m, e_m, optimize=True)
+        if cov_intercept == "mc":
+            W0_new = symmetrize(W0_new + R_m)              # conserve total covariance
+        # streaming E_S vs the LS fit (diagnostic; excludes the atom-in-fit R term)
+        W0_ls = W0_new - (R_m if cov_intercept == "mc" else 0.0)
+        R2 = R2_pos / mass_f
+        if atom == "fit" and p0 > 0.0:
+            R2 += (p0 / mass_f) * float(np.einsum("ab,ab->", S_at_new, S_at_new))
+        ay2 = float(fw @ (fit_a ** 2))
+        E_S_post = (R2
+                    - 2.0 * float(np.einsum("ab,ab->", AR_f, W0_ls))
+                    - 2.0 * float(np.einsum("ab,ab->", AyR_f, W1_new))
+                    + float(np.einsum("ab,ab->", W0_ls, W0_ls))
+                    + 2.0 * abar * float(np.einsum("ab,ab->", W0_ls, W1_new))
+                    + ay2 * float(np.einsum("ab,ab->", W1_new, W1_new)))
+    else:                                                  # everything died at ReLU
+        m0_new = np.zeros(d); m1_new = np.zeros(d)
+        W0_new = np.zeros((d, d)); W1_new = np.zeros((d, d))
+        R_m = np.zeros((d, d))
+
+    keep_atom_exact = (atom == "exact" and p0 > 0.0)
+    parts_p = [w[pos]]; parts_a = [y[pos]]
+    if p0 > 0.0:
+        parts_p.insert(0, np.array([p0])); parts_a.insert(0, np.array([0.0]))
+    p_new = np.concatenate(parts_p)
+    new_state = PostAffineState(
+        p=p_new / p_new.sum(), a=np.concatenate(parts_a),
+        m0=m0_new, m1=m1_new, W0=W0_new, W1=W1_new,
+        atom_m=(m_at_new if keep_atom_exact else None),
+        atom_S=(S_at_new if keep_atom_exact else None))
+    _t = _phase("fit", _t)
+
+    if stats is not None:
+        distortion = float((PQ * ((ymean - y[None, :]) ** 2 + vv)).sum() / W_tot)
+        stats.setdefault("mass_lost", []).append(float(max(0.0, 1.0 - W_tot)))
+        stats.setdefault("E_m", []).append(E_m_post)       # POST-fit mean residual
+        stats.setdefault("E_S", []).append(E_S_post)       # POST-fit cov residual
+        stats.setdefault("tr_R_m", []).append(float(np.trace(R_m)))
+        stats.setdefault("scalar_distortion", []).append(distortion)
+        stats.setdefault("psd_clipped", []).append(psd_clipped)
+        stats.setdefault("num_cells", []).append(int(J))
+        stats.setdefault("num_pos_nodes", []).append(int(pos.sum()))
+        stats.setdefault("zero_atom_mass", []).append(p0)
+    return new_state
+
+
+def unconditional_mean_post(state: PostAffineState) -> np.ndarray:
+    """Full mean ``E[X]`` for a post-affine state (readout, eq 126)."""
+    out = np.empty(state.d + 1)
+    out[SPIKE_COORD] = float(state.p @ state.a)
+    bulk = np.zeros(state.d)
+    for k in range(state.num_nodes):
+        if state.atom_m is not None and k == 0:
+            bulk += state.p[k] * state.atom_m
+        else:
+            bulk += state.p[k] * (state.m0 + state.m1 * state.a[k])
+    out[1:] = bulk
     return out

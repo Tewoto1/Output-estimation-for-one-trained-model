@@ -19,22 +19,37 @@ per-layer d^3 congruence cost is O(1) rather than O(num_bins):
     model, _ = MLP.load("checkpoints/spike_kprop/spike-e1_d3_w128_seed1_final.pt")
     pred = run_analytic_kprop(model, config={"num_nodes": 40})["mean"]
 
-The core (``core.py``) is numpy/scipy and torch-free; only the ``adapter`` model
-path touches torch. Scalar-law variants beyond the exact-cell backend (paper
-section 7.3: mixture-integral, atomic-node, single-Gaussian) are future knobs.
+The core (``core.py``) is numpy/scipy and torch-free by default; ``workers``
+threads the per-node exact-ReLU loop exactly like the binned companion
+(``"auto"`` = parallel per machine, identical results either way), and the
+optional ``device="cuda"`` knob torch-offloads the Sigma-stack congruences
+(guarded import, numpy fallback). Only the ``adapter`` model path requires
+torch.
+
+``fit="post"`` selects the POST-activation affine variant (``PostAffineState``):
+the family ``B|A=a ~ N(m0 + m1 a, W0 + W1 a)`` is fitted after ReLU, so the
+linear step just transforms the four family objects (2-3 congruences, NO
+per-node matrix state -- memory O(d^2)); ``atom="exact"|"fit"`` toggles whether
+the zero atom (the merge of all negative cells) stays a separate exact component
+or joins the linearity hypothesis. Scalar-law variants beyond the exact-cell
+backend (paper section 7.3) are future knobs.
 """
 from .core import (
     SPIKE_COORD,
     AnalyticState,
     AffineState,
+    PostAffineState,
     gaussian_input_state,
+    gaussian_input_state_post,
     analytic_layer_update,
+    analytic_layer_update_post,
     negative_mass,
     split_node_budget,
     make_cells,
     percell_bulk_moments,
     unconditional_mean,
     unconditional_mean_cov,
+    unconditional_mean_post,
     run_analytic_kprop_k2,
 )
 from .adapter import (
@@ -46,10 +61,12 @@ from .adapter import (
 
 __all__ = [
     # core
-    "SPIKE_COORD", "AnalyticState", "AffineState", "gaussian_input_state",
-    "analytic_layer_update", "negative_mass", "split_node_budget", "make_cells",
+    "SPIKE_COORD", "AnalyticState", "AffineState", "PostAffineState",
+    "gaussian_input_state", "gaussian_input_state_post",
+    "analytic_layer_update", "analytic_layer_update_post",
+    "negative_mass", "split_node_budget", "make_cells",
     "percell_bulk_moments", "unconditional_mean", "unconditional_mean_cov",
-    "run_analytic_kprop_k2",
+    "unconditional_mean_post", "run_analytic_kprop_k2",
     # MLP adapter
     "run_analytic_kprop", "default_analytic_kprop_config", "config_summary",
     "extract_mean",

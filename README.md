@@ -36,7 +36,7 @@ Mecha_preds/      mechanistic predictors
                     discretized only transiently into num_nodes closed-form quadrature
                     cells per layer (O(1) congruences/layer, not O(num_bins)). Spec:
                     writeups/analytic_affine_kprop.pdf; see Mecha_preds/analytic_kprop/README.md
-colab_notebooks/  generated notebooks + their build_*.py generators (+ shared _nb.py)
+experiments/  generated notebooks + their build_*.py generators (+ shared _nb.py)
 utils.py          device / seeding / numpy helpers
 ```
 
@@ -162,11 +162,11 @@ python -m Mecha_preds.cumulants.run_comparison \
     --outdir results/zero_kprop
 ```
 
-## Notebooks (`colab_notebooks/`)
+## Notebooks (`experiments/`)
 
 Each notebook is **generated** from the `build_*.py` script next to it (edit the
 script, re-run it — keeps notebooks reproducible and diffable). Builders share
-`colab_notebooks/_nb.py`. Each notebook defines its **own knobs and its own
+`experiments/_nb.py`. Each notebook defines its **own knobs and its own
 `CKPT_DIR`** in its config cell — probe there in place; `experiments.py` keeps the
 classic defaults plus the naming/recycling machinery.
 

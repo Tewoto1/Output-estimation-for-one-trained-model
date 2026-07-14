@@ -10,7 +10,9 @@ M = W + e₁ e₁ᵀ ,     W_ij ~ N(0, 1/n)
 Implements **Algorithm 7.2** (finite-grid, exact-cell scalar backend) of the write-up
 [`writeups/analytic_affine_kprop.pdf`](../../writeups/analytic_affine_kprop.pdf) — the
 analytic alternative to the companion [`binned_kprop`](../binned_kprop/README.md)
-(paper appendix C relates the two).
+(paper appendix C relates the two). The implementation-level write-up of **both
+fit variants** with the full asymptotic runtime/memory analysis is in
+[ALGORITHM.md](ALGORITHM.md).
 
 ## The idea
 

@@ -105,7 +105,7 @@ PRED_DIR = os.path.join(CKPT_DIR, "pred")
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--widths", type=int, nargs="+",
-                   default=[16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 3072, 4096])
+                   default=[16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 3072])
     p.add_argument("--num-seeds", type=int, default=10, help="seeds 10..10+N-1 (default 10)")
     p.add_argument("--num-nodes", type=int, nargs="+", default=[6, 12, 20, 40, 80],
                    help="analytic node budgets to sweep")
@@ -123,7 +123,7 @@ def parse_args() -> argparse.Namespace:
                    help="fit='post' only: keep the zero atom (merge of all negative "
                         "cells) as a separate EXACT component, or fold it into the "
                         "affine family (the linearity-includes-the-atom hypothesis)")
-    p.add_argument("--mc-samples", type=int, default=20_000_000)
+    p.add_argument("--mc-samples", type=int, default=100_000_000)
     p.add_argument("--mc-batch", type=int, default=200_000)
     p.add_argument("--binned-bins", type=int, default=40)
     p.add_argument("--binned-max-width", type=int, default=1024,
@@ -198,31 +198,59 @@ def _mc_halves_numpy(Ws, n, samples, batch, seed):
 
 
 def _mc_halves_torch(Ws, n, samples, batch, seed):
+    """One seed's MC reference on the GPU. Runs on its OWN CUDA stream so that
+    concurrent seed threads (phase A) actually overlap on-device instead of
+    serializing on the default stream. Per-seed results are bit-identical to the
+    serial version: each task has its own generator and its ops stay ordered
+    within its stream."""
     import torch
     torch.backends.cuda.matmul.allow_tf32 = False       # keep full fp precision
     dev = torch.device("cuda")
     dt = torch.float64
     batch = min(batch, max(20_000, int(4e9 / (n * 8))), max(1, samples // 2))
     # (memory cap on the activation buffers; >= 2 batches so BOTH halves fill)
-    Wt = [torch.as_tensor(W, dtype=dt, device=dev) for W, _ in Ws]
-    g = torch.Generator(device=dev).manual_seed(seed)
-    out_dim = Ws[-1][0].shape[0]
-    acc = [torch.zeros(out_dim, dtype=dt, device=dev) for _ in range(2)]
-    cnt = [0, 0]
-    accsq = torch.zeros(out_dim, dtype=dt, device=dev); c = 0; k = 0
-    while c < samples:
-        b = min(batch, samples - c)
-        h = torch.randn(b, n, generator=g, dtype=dt, device=dev)
-        for li, W in enumerate(Wt):
-            z = h @ W.T
-            h = torch.relu(z) if li < len(Wt) - 1 else z
-        acc[k % 2] += h.sum(0); cnt[k % 2] += b
-        accsq += (h ** 2).sum(0); c += b; k += 1
-    muA = (acc[0] / max(cnt[0], 1)).cpu().numpy()
-    muB = (acc[1] / max(cnt[1], 1)).cpu().numpy()
-    mu = ((acc[0] + acc[1]) / c).cpu().numpy()
-    se = torch.sqrt(torch.clamp(accsq / c - torch.as_tensor(mu, device=dev) ** 2, min=0) / c)
-    return mu, se.cpu().numpy(), muA, muB, cnt[0], cnt[1]
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        Wt = [torch.as_tensor(W, dtype=dt, device=dev) for W, _ in Ws]
+        g = torch.Generator(device=dev).manual_seed(seed)
+        out_dim = Ws[-1][0].shape[0]
+        acc = [torch.zeros(out_dim, dtype=dt, device=dev) for _ in range(2)]
+        cnt = [0, 0]
+        accsq = torch.zeros(out_dim, dtype=dt, device=dev); c = 0; k = 0
+        while c < samples:
+            b = min(batch, samples - c)
+            h = torch.randn(b, n, generator=g, dtype=dt, device=dev)
+            for li, W in enumerate(Wt):
+                z = h @ W.T
+                h = torch.relu(z) if li < len(Wt) - 1 else z
+            acc[k % 2] += h.sum(0); cnt[k % 2] += b
+            accsq += (h ** 2).sum(0); c += b; k += 1
+        muA = (acc[0] / max(cnt[0], 1)).cpu().numpy()
+        muB = (acc[1] / max(cnt[1], 1)).cpu().numpy()
+        mu = ((acc[0] + acc[1]) / c).cpu().numpy()
+        se = torch.sqrt(torch.clamp(accsq / c - torch.as_tensor(mu, device=dev) ** 2, min=0) / c)
+        se = se.cpu().numpy()
+    stream.synchronize()
+    return mu, se, muA, muB, cnt[0], cnt[1]
+
+
+def mc_parallelism(args, n, use_gpu):
+    """How many seeds' MC references to run concurrently.
+
+    GPU: capped by device memory -- each task holds ~3 live activation buffers
+    of min(mc_batch, 4e9/(n*8)) x n float64 (randn output, matmul input/output)
+    plus the weight stack, and we budget 70% of VRAM. At the 4GB/buffer batch
+    cap this gives ~4 tasks at n=4096 and full seed-parallelism below ~1536.
+    CPU: small constant -- BLAS inside each task is already multithreaded.
+    """
+    if not use_gpu:
+        return max(1, min(4, args.num_seeds))
+    import torch
+    total = torch.cuda.get_device_properties(0).total_memory
+    b = min(args.mc_batch, max(20_000, int(4e9 / (n * 8))))
+    weights = args.depth * n * n + args.out_dim * n     # float64 weight stack
+    per_task = (3 * b * n + weights) * 8
+    return int(max(1, min(args.num_seeds, (0.7 * total) // per_task)))
 
 
 def mc_reference(args, n, seed, use_gpu):
@@ -338,8 +366,16 @@ def main():
         outer, inner, est_gb = plan_parallelism(args, n)
         ana_dev = ("cuda" if (use_gpu and n >= args.gpu_congr_min_width) else None)
 
-        # phase A -- MC references (GPU-serial; cached)
-        mcs = {s: mc_reference(args, n, s, use_gpu) for s in args.seeds}
+        # phase A -- MC references (parallel across seeds, own CUDA stream each,
+        # concurrency capped by GPU memory; cached)
+        mc_w = mc_parallelism(args, n, use_gpu)
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=mc_w) as ex:
+            mcs = dict(zip(args.seeds,
+                           ex.map(lambda s: mc_reference(args, n, s, use_gpu),
+                                  args.seeds)))
+        print(f"  [mc] width {n}: all {len(args.seeds)} refs in "
+              f"{time.time()-t0:.1f}s ({mc_w} parallel)", flush=True)
 
         # phase B -- all seeds in parallel; each task sweeps the node budgets
         fits = ["pre", "post"] if args.fit == "both" else [args.fit]

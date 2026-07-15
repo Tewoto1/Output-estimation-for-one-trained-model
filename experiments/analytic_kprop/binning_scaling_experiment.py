@@ -70,11 +70,20 @@ import numpy as np
 # repo bootstrap (script can be launched from anywhere, incl. `c run`)
 # --------------------------------------------------------------------------- #
 def _find_repo() -> str:
-    here = os.path.dirname(os.path.abspath(__file__))
-    for _ in range(6):
-        if os.path.isfile(os.path.join(here, "model", "mlp.py")):
-            return here
-        here = os.path.dirname(here)
+    starts = [os.environ.get("REPO_ROOT", "")]
+    try:
+        starts.append(os.path.dirname(os.path.abspath(__file__)))
+    except NameError:
+        # ARC-infra `c run` exec's the source with no __file__; REPO_ROOT is
+        # exported by RUN_ENV in ~/.arc_infra_config.py
+        pass
+    starts += [os.getcwd(), os.path.expanduser("~/code/one_trained_case")]
+    for start in starts:
+        here = start
+        for _ in range(6):
+            if here and os.path.isfile(os.path.join(here, "model", "mlp.py")):
+                return here
+            here = os.path.dirname(here)
     raise RuntimeError("could not locate the repo root (model/mlp.py marker)")
 
 
@@ -100,7 +109,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-seeds", type=int, default=10, help="seeds 10..10+N-1 (default 10)")
     p.add_argument("--num-nodes", type=int, nargs="+", default=[6, 12, 20, 40, 80],
                    help="analytic node budgets to sweep")
-    p.add_argument("--depth", type=int, default=2)
+    p.add_argument("--depth", type=int, default=3)
     p.add_argument("--theta", type=float, default=1.0)
     p.add_argument("--out-dim", type=int, default=8)
     p.add_argument("--grid", default="w2", choices=["w2", "uniform"])
@@ -114,7 +123,7 @@ def parse_args() -> argparse.Namespace:
                    help="fit='post' only: keep the zero atom (merge of all negative "
                         "cells) as a separate EXACT component, or fold it into the "
                         "affine family (the linearity-includes-the-atom hypothesis)")
-    p.add_argument("--mc-samples", type=int, default=10_000_000)
+    p.add_argument("--mc-samples", type=int, default=20_000_000)
     p.add_argument("--mc-batch", type=int, default=200_000)
     p.add_argument("--binned-bins", type=int, default=40)
     p.add_argument("--binned-max-width", type=int, default=1024,

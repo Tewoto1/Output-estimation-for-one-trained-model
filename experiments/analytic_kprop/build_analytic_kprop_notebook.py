@@ -97,9 +97,9 @@ DEVICE        = None            # e.g. "cuda": torch-offload the analytic Sigma 
 MC_DEVICE     = "cpu" if QUICK else "cuda"
 
 SCALE_WIDTHS  = [16, 32, 64, 128] if QUICK else [16, 32, 64, 128, 256, 512, 1024]
-SCALE_DEPTH   = 2
+SCALE_DEPTH   = 3
 SCALE_SEEDS   = [10, 11]
-MC_SAMPLES    = 2_000_000 if QUICK else 10_000_000
+MC_SAMPLES    = 2_000_000 if QUICK else 20_000_000
 MC_BATCH      = 200_000
 
 BINNED_BUDGET = 40              # binned num_bins matched to the analytic num_nodes headline

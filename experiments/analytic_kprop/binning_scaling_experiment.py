@@ -106,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--widths", type=int, nargs="+",
                    default=[16, 32, 64, 128, 256, 512, 1024, 1536, 2048, 3072])
-    p.add_argument("--num-seeds", type=int, default=10, help="seeds 10..10+N-1 (default 10)")
+    p.add_argument("--num-seeds", type=int, default=20, help="seeds 100..100+N-1 (default 20)")
     p.add_argument("--num-nodes", type=int, nargs="+", default=[6, 12, 20, 40, 80],
                    help="analytic node budgets to sweep")
     p.add_argument("--depth", type=int, default=3)
@@ -142,7 +142,7 @@ def parse_args() -> argparse.Namespace:
         a.num_nodes = [6, 12]
         a.mc_samples = 200_000
         a.binned_max_width = 64
-    a.seeds = list(range(10, 10 + a.num_seeds))
+    a.seeds = list(range(100, 100 + a.num_seeds))
     a.threads = a.threads or (os.cpu_count() or 4)
     if a.mem_gb <= 0:
         try:

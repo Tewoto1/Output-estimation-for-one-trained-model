@@ -111,7 +111,10 @@ serial; identical results; env `BINNED_KPROP_WORKERS`), `device` (`None` = numpy
 `"cuda"` = torch congruences, numpy fallback if unavailable).
 
 Experiments + validation: `experiments/analytic_kprop/` — the notebook
-(`analytic_kprop_colab.ipynb`) for cheap validation/diagnostics, and
+(`analytic_kprop_colab.ipynb`) for cheap validation/diagnostics,
+**`affine_r2_experiment.py`** for the per-layer weighted R² of the affine
+hypothesis (pre vs post, mean & cov, ± zero atom, 1−R² width scaling; no MC
+needed), and
 **`binning_scaling_experiment.py`** for the width-scaling law at A100 scale
 (widths up to 4096, 10 parallel seeds, split-half cross-MSE to beat the MC-noise
 floor; ARC-infra runnable via `c run [name] "experiments/analytic_kprop/

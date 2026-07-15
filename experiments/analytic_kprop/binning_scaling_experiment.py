@@ -52,7 +52,9 @@ prediction VECTOR is cached as checkpoints/analytic_kprop/pred/*.npz keyed by th
 net + predictor config only -- re-running with a bigger MC budget re-scores the
 cached predictions instead of recomputing them.
 
-Local smoke test:   python experiments/analytic_kprop/binning_scaling_experiment.py --quick
+Mode AUTO-DETECTS like the repo notebooks (experiments.py: QUICK = CPU-only):
+full sweep on a GPU box, quick smoke test otherwise; --quick / --full override.
+Local smoke test:   python experiments/analytic_kprop/binning_scaling_experiment.py
 """
 from __future__ import annotations
 
@@ -102,6 +104,15 @@ PRED_DIR = os.path.join(CKPT_DIR, "pred")
 # --------------------------------------------------------------------------- #
 # config
 # --------------------------------------------------------------------------- #
+def _detect_cpus() -> int:
+    """The CPUs this process may actually use: cgroup/affinity-aware (a container
+    or scheduler mask can differ from os.cpu_count(), in either direction)."""
+    try:
+        return len(os.sched_getaffinity(0)) or (os.cpu_count() or 4)
+    except AttributeError:
+        return os.cpu_count() or 4
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--widths", type=int, nargs="+",
@@ -134,8 +145,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gpu-congr-min-width", type=int, default=1024,
                    help="use device='cuda' for the analytic congruences from this width up")
     p.add_argument("--no-gpu", action="store_true", help="force numpy/CPU everywhere")
-    p.add_argument("--quick", action="store_true", help="tiny local smoke test")
+    p.add_argument("--quick", action="store_true", help="force the tiny smoke test")
+    p.add_argument("--full", action="store_true",
+                   help="force the full sweep even on a CPU-only machine")
     a = p.parse_args()
+    a.gpu_available = (not a.no_gpu) and _cuda_available()
+    # FULL by default. (The old auto-quick-when-no-GPU heuristic misfired: a
+    # CPU-only box is not necessarily a small box -- e.g. a 24-core host. Pass
+    # --quick explicitly for the smoke test; --full is kept as a no-op.)
     if a.quick:
         a.widths = [16, 32, 64]
         a.num_seeds = 3
@@ -143,7 +160,7 @@ def parse_args() -> argparse.Namespace:
         a.mc_samples = 200_000
         a.binned_max_width = 64
     a.seeds = list(range(100, 100 + a.num_seeds))
-    a.threads = a.threads or (os.cpu_count() or 4)
+    a.threads = a.threads or _detect_cpus()
     if a.mem_gb <= 0:
         try:
             with open("/proc/meminfo") as f:
@@ -154,14 +171,19 @@ def parse_args() -> argparse.Namespace:
     return a
 
 
-def _gpu_available(args) -> bool:
-    if args.no_gpu:
-        return False
+def _cuda_available() -> bool:
+    """The repo-wide GPU signal (mirrors experiments.py: QUICK = CPU-only).
+    Import ``experiments`` when possible (single source of truth); otherwise
+    probe torch directly; no torch -> CPU-only."""
     try:
-        import torch
-        return torch.cuda.is_available()
-    except ModuleNotFoundError:
-        return False
+        import experiments as E
+        return not E.QUICK
+    except Exception:
+        try:
+            import torch
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
 
 
 # --------------------------------------------------------------------------- #
@@ -241,10 +263,16 @@ def mc_parallelism(args, n, use_gpu):
     of min(mc_batch, 4e9/(n*8)) x n float64 (randn output, matmul input/output)
     plus the weight stack, and we budget 70% of VRAM. At the 4GB/buffer batch
     cap this gives ~4 tasks at n=4096 and full seed-parallelism below ~1536.
-    CPU: small constant -- BLAS inside each task is already multithreaded.
+    CPU: as many seeds as cores/RAM allow. (Measured: at these matrix sizes the
+    per-seed forward barely multithreads inside BLAS -- refs take the same ~t
+    whether or not neighbors run -- so a small constant here wastes the box;
+    numpy matmuls release the GIL, so a thread per seed scales.)
     """
     if not use_gpu:
-        return max(1, min(4, args.num_seeds))
+        b = min(args.mc_batch, max(1, args.mc_samples // 2))
+        per_task_gb = (3 * b * n + args.depth * n * n) * 8 / 1e9 + 0.1
+        return int(max(1, min(args.num_seeds, args.threads,
+                              args.mem_gb / per_task_gb)))
     import torch
     total = torch.cuda.get_device_properties(0).total_memory
     b = min(args.mc_batch, max(20_000, int(4e9 / (n * 8))))
@@ -349,9 +377,11 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
     points_path = os.path.join(results_dir, "points.jsonl")
 
-    use_gpu = _gpu_available(args)
+    use_gpu = args.gpu_available
+    print(f"mode={'QUICK (no GPU detected; pass --full to override)' if args.quick else 'FULL'} "
+          f"| gpu={use_gpu}")
     print(f"widths={args.widths} seeds={args.seeds} num_nodes={args.num_nodes} "
-          f"depth={args.depth} MC={args.mc_samples:,} gpu={use_gpu} "
+          f"depth={args.depth} MC={args.mc_samples:,} fit={args.fit} "
           f"threads={args.threads} mem_gb={args.mem_gb:.0f}", flush=True)
     print(f"RESULTS_DIR={results_dir}", flush=True)
 
@@ -511,4 +541,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException:
+        import traceback
+        traceback.print_exc(file=sys.stdout)   # `c tail` follows stdout
+        sys.stdout.flush()
+        raise

@@ -29,7 +29,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from .binning import find_bin, safe_bin_representative, _DEFAULT_MIN_PROB
+from .binning import _DEFAULT_MIN_PROB
 from .core import BinnedK2State, symmetrize, SPIKE_COORD
 
 
@@ -135,15 +135,20 @@ class BinnedKState:
                              mu=self.cumulants[1].copy(), Sigma=self.cumulants[2].copy())
 
 
-def relu_step_k_general(state: BinnedKState, post_edges: np.ndarray, k_max: int,
+def relu_step_k_general(state: BinnedKState, post_edges=None, k_max: int = 2,
                         kind="SIMPLE", *, min_prob: float = _DEFAULT_MIN_PROB,
                         exact_relu_cov: bool = False,
                         merge_order: int = 2) -> BinnedKState:
     """ReLU step for the general-K binned state (spec section 10.4 + the merge of 8.3/9).
 
     Per bin, the bulk cumulant tower goes through ORDINARY kprop
-    (``bulk_relu_kprop_tower``); the spike representatives are mapped through ReLU and
-    bins are merged. The cross-bin MIXTURE is computed up to ``merge_order``
+    (``bulk_relu_kprop_tower``). Spike side: NO RE-BINNING (matching ``relu_step_k2``) --
+    positive bins pass through with ``(p, a)`` untouched, and all nonpositive bins merge
+    exactly into the single zero atom (order-2 mixture moments). ``post_edges`` is
+    accepted for backward compatibility and IGNORED (the historical re-bin onto a
+    nonnegative post grid could only merge distinct positive bins).
+
+    The cross-bin MIXTURE (zero atom only now) is computed up to ``merge_order``
     (default 2 = mean + covariance, the explicit formulas of spec 5-7/10.3). Merging the
     within-bin cumulants of order >= 3 across bins needs the full ``mix_cumulants``
     moment<->cumulant machinery (spec 10.3); that is intentionally left as the documented
@@ -155,11 +160,12 @@ def relu_step_k_general(state: BinnedKState, post_edges: np.ndarray, k_max: int,
             "cross-bin merge is implemented at order 2 (mean+cov); higher-order mixture "
             "needs mix_cumulants (spec 10.3) -- per-bin kprop runs at any k_max, but the "
             "discrete-mixture merge of order>=3 cumulants is the documented K>2 boundary.")
+    if post_edges is not None:
+        from .core import _post_edges_removed_notice
+        _post_edges_removed_notice("relu_step_k_general")
     p, avals = state.p, state.a
     m_old = p.shape[0]
     d = state.bulk_d
-    post_edges = np.asarray(post_edges, dtype=np.float64)
-    m_post = post_edges.shape[0] - 1
 
     # 1) per-bin bulk ReLU through ordinary kprop (any k_max)
     a_bulk = np.zeros((m_old, d))
@@ -172,32 +178,26 @@ def relu_step_k_general(state: BinnedKState, post_edges: np.ndarray, k_max: int,
         a_bulk[alpha] = out[1]
         Sig_bulk[alpha] = symmetrize(out.get(2, np.zeros((d, d))))
 
-    # 2) map spike reps through ReLU, merge bins (order-2 mixture)
-    old_to_new = [find_bin(post_edges, max(float(avals[a]), 0.0)) for a in range(m_old)]
-    p_new = np.zeros(m_post)
-    for alpha in range(m_old):
-        if p[alpha] > 0:
-            p_new[old_to_new[alpha]] += p[alpha]
-    a_new = np.zeros(m_post)
-    mu_new = np.zeros((m_post, d))
-    Sig_new = np.zeros((m_post, d, d))
-    for beta in range(m_post):
-        if p_new[beta] <= min_prob:
-            a_new[beta] = safe_bin_representative(post_edges, beta)
-            continue
-        alphas = [a for a in range(m_old) if old_to_new[a] == beta and p[a] > 0]
-        eta = np.array([p[a] / p_new[beta] for a in alphas])
-        a_new[beta] = float(sum(e * max(float(avals[a]), 0.0) for e, a in zip(eta, alphas)))
-        for e, a in zip(eta, alphas):
-            mu_new[beta] += e * a_bulk[a]
-        S = np.zeros((d, d))
-        for e, a in zip(eta, alphas):
-            delta = a_bulk[a] - mu_new[beta]
-            S += e * (Sig_bulk[a] + np.outer(delta, delta))
-        Sig_new[beta] = symmetrize(S)
+    # 2) spike: keep positive bins verbatim; merge nonpositive bins into the zero atom
+    live = p > 0.0
+    pos_idx = np.nonzero(live & (avals > 0.0))[0]
+    neg_idx = np.nonzero(live & (avals <= 0.0))[0]
+    parts_p = [p[pos_idx]]; parts_a = [avals[pos_idx]]
+    parts_m = [a_bulk[pos_idx]]; parts_S = [Sig_bulk[pos_idx]]
+    p0 = float(p[neg_idx].sum())
+    if p0 > 0.0:
+        eta = p[neg_idx] / p0
+        m0 = eta @ a_bulk[neg_idx]
+        dm = a_bulk[neg_idx] - m0[None, :]
+        S0 = (np.einsum("j,jab->ab", eta, Sig_bulk[neg_idx], optimize=True)
+              + np.einsum("j,ja,jb->ab", eta, dm, dm, optimize=True))
+        parts_p.insert(0, np.array([p0])); parts_a.insert(0, np.array([0.0]))
+        parts_m.insert(0, m0[None, :]); parts_S.insert(0, symmetrize(S0)[None])
 
+    p_new = np.concatenate(parts_p)
     total = p_new.sum()
     if total <= 0:
         raise RuntimeError("all spike-bin mass vanished in relu_step_k_general")
-    p_new = p_new / total
-    return BinnedKState(p=p_new, a=a_new, cumulants={1: mu_new, 2: Sig_new})
+    return BinnedKState(p=p_new / total, a=np.concatenate(parts_a),
+                        cumulants={1: np.concatenate(parts_m, axis=0),
+                                   2: np.concatenate(parts_S, axis=0)})

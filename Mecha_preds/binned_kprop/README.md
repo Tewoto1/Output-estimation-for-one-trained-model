@@ -57,7 +57,9 @@ model, _ = MLP.load("checkpoints/spike_kprop/spike-e1_d3_w128_seed1_final.pt")
 pred = run_binned_kprop(model, config={"num_bins": 31})["mean"]   # K=2; 31 spike bins
 ```
 
-`config` keys: `num_bins` (the hyperparameter), `num_bins_post`, `bulk_relu`
+`config` keys: `num_bins` (the POSITIVE-side bin budget — the hyperparameter; the ReLU
+keeps exactly these bins + the zero atom, no post-ReLU re-binning exists), `num_bins_pre_neg`
+(negative-side override; default = mass-adaptive, cap `max_bins_neg` = 8×budget), `bulk_relu`
 (`"exact"` | `"gain"` | `"kprop"`), `input_std`. Pass `add_spike=True` to add
 `e₁ e₁ᵀ` to each square hidden layer when the spike isn't already baked into the weights
 (default `False` — assume it is, like `spikekprop`). Requires square hidden layers

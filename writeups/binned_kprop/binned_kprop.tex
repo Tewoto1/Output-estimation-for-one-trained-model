@@ -19,17 +19,12 @@
 \newcommand{\relu}{\rho}
 \DeclareMathOperator{\diag}{diag}
 
-\title{Binned $K$-Propagation for Coordinate-Spiked ReLU Networks\\
-{\large A hidden-Markov model over the spike coordinate with conditional bulk cumulant propagation}}
-\author{Yuzheng Wu}
+\title{Binned $K$-Propagation for Coordinate-Spiked ReLU Networks}
+\author{Tony}
 \date{July 2026}
 
 \begin{document}
 \maketitle
-
-\begin{abstract}
-We describe \textsc{binned-kprop}, a mechanistic predictor of $\E[f(X)]$, $X \sim \N(0, I_n)$, for a ReLU MLP $f$ whose hidden weight matrices carry a single-coordinate rank-one spike $M = W + e_1 e_1^\top$. Ordinary total-order cumulant propagation (\emph{kprop}) truncated at order $K$ fails here: the spike coordinate retains $O(1)$ cumulants at \emph{every} order, so no fixed truncation captures it. The algorithm instead splits each layer vector into the scalar spike coordinate $A$ and the bulk $B \perp e_1$, represents $A$ non-parametrically by a discrete law over $m$ bins evolving as a hidden-Markov model between layers, and propagates $B$ by ordinary $K=2$ cumulant propagation \emph{conditionally on each bin}. Every update is in closed form (Gaussian and truncated-Gaussian integrals). Bin edges and representatives are chosen to minimize the Wasserstein-2 distance to the exact per-layer law of $A$, which under the $K=2$ closure is a Gaussian mixture; the $W_2$-optimal quantizer is computed by Lloyd--Max iteration with closed-form mixture centroids. Empirically the predictor recovers the budget rate $\mathrm{MSE} \sim n^{-2}$ in the width $n$, while the naive one-bin closure only attains $n^{-1}$.
-\end{abstract}
 
 \section{Setting and motivation}
 
@@ -57,11 +52,9 @@ M = \begin{pmatrix} \gamma & r^\top \\ u & V \end{pmatrix},
 \]
 so one linear layer acts as
 \begin{equation}
-\boxed{\;A^+ = \gamma A + r^\top B, \qquad B^+ = u A + V B.\;}
+\boxed{\;A^+ = \gamma A + r^\top B, \qquad B^+ = A u + V B.\;}
 \label{eq:linear}
 \end{equation}
-
-\paragraph{Why bin the spike.} For a \emph{flat} spike $\frac{1}{n}\bm{1}\bm{1}^\top$, the spike direction picks up a flat-loop $1/n$ discount in the diagrammatics and ordinary total-order kprop is accurate. A \emph{coordinate} spike has no such discount: the map \eqref{eq:linear} preserves an $O(1)$ residue of coordinate $0$ ($\gamma = W_{00} + 1 \approx 1$), so the cumulants of $A$ are $O(1)$ at \textbf{every} order and cannot be truncated at any fixed $K$. The remedy is to stop parameterizing $A$ by cumulants altogether: represent its law \emph{non-parametrically} as a discrete distribution over $m$ bins --- a hidden-Markov model over the spike coordinate, with a scalar transition kernel between layers --- and run ordinary $K=2$ cumulant propagation on the bulk $B$ \emph{conditional on each bin}.
 
 \section{State}
 
@@ -84,9 +77,11 @@ $\Sigma_\alpha$ & $(m, d, d)$ & conditional bulk covariance $\Cov[B \mid \text{b
 \bottomrule
 \end{tabular}
 \end{center}
-Coordinate $0$ never appears inside $\mu$ or $\Sigma$; the spike lives only in $(p, v)$. Within a bin, $A$ is collapsed to the single point $v_\alpha$ --- this is the one approximation binning introduces in the spike direction, and Section~\ref{sec:w2} chooses the bins to minimize it.
+Coordinate $0$ never appears inside $\mu$ or $\Sigma$; the spike lives only in $(p, v)$. Within a bin, $A$ is collapsed to the single point $v_\alpha$. 
 
 \section{Initialization}
+
+\textbf{TLDR: We bin the initial state, notations $\phi$ and $\Phi$ denote the Gaussian pdf and cdf respectively.}
 
 With $X^{(0)} \sim \N(0, I_n)$ we have $A^{(0)} \sim \N(0,1)$ independent of $B^{(0)} \sim \N(0, I_d)$. Given pre-activation edges $z_0 = -\infty < z_1 < \dots < z_m = +\infty$ defining bins $[z_{\alpha-1}, z_\alpha)$,
 \begin{equation}
@@ -103,6 +98,9 @@ where $\varphi, \Phi$ are the standard-normal pdf and cdf. The truncated-normal 
 Fix an old bin $\alpha$: inside it, $A = v_\alpha$ is a point and $B \sim \N(\mu_\alpha, \Sigma_\alpha)$. Push both through~\eqref{eq:linear}.
 
 \subsection{The joint Gaussian $(Y, C)$}
+
+\textbf{TLDR: Calculating the mean and covariance of one of the binned perpendicular Gaussians $X$ pass a linear layer.}
+
 The new scalar spike pre-activation and new bulk vector are one affine map of the Gaussian $B$,
 \[
 \begin{pmatrix} Y_\alpha \\ C_\alpha \end{pmatrix}
@@ -137,28 +135,45 @@ p^+_\beta = \sum_\alpha p_\alpha\, Q_{\beta\alpha} \quad (p^+ = Q\,p), \qquad
 This is exactly one step of a hidden-Markov filter with emission ``which bin did $Y$ land in.''
 
 \subsection{Conditioning the bulk on $Y \in I_\beta$}
+
+\textbf{TLDR: Conditional mean and covariance of the transformed gaussian $MX_{\alpha}$ from bin $\alpha$ to bin $\beta$. Formula in $\ref{eq:condition}$}
+
 The truncated-normal moments of $Y$ on $I_\beta$ (writing $Z = Q_{\beta\alpha}$) are
 \[
 \tau_1 = \E[Y - m_Y \mid I_\beta] = s_Y \frac{\varphi(a) - \varphi(b)}{Z}, \qquad
 \tau_2 = \E[(Y - m_Y)^2 \mid I_\beta] = s_Y^2 \Big[ 1 + \frac{a\varphi(a) - b\varphi(b)}{Z} \Big],
 \]
-so $\Var(Y \mid I_\beta) = \tau_2 - \tau_1^2$. Because $(Y, C)$ is jointly Gaussian, the regression of $C$ on $Y$ is exact:
+so $\Var(Y \mid I_\beta) = \tau_2 - \tau_1^2$.
+
+To condition $C$ on where $Y$ landed, split $C$ into the part carried by $Y$ and a remainder independent of $Y$. With $\kappa := g / s_Y^2$, define
 \[
-C_\alpha = m_C + \frac{g}{s_Y^2}(Y_\alpha - m_Y) + C_\perp, \qquad
-C_\perp \perp Y_\alpha, \qquad
-\Cov(C_\perp) = \Sigma_C - \frac{g g^\top}{s_Y^2}.
+C_\perp := C_\alpha - m_C - \kappa\,(Y_\alpha - m_Y).
 \]
-Taking conditional mean and covariance over $Y \in I_\beta$ (only the $Y$-dependent part feels the truncation),
+The coefficient $\kappa$ is chosen exactly so that the remainder is uncorrelated with $Y$:
+$\Cov(C_\perp, Y) = g - \kappa\, s_Y^2 = 0$; and since $(Y, C)$ is jointly Gaussian, uncorrelated means \emph{independent}. $C_\perp$ is thus a zero-mean Gaussian, independent of $Y$, with
+\[
+\Cov(C_\perp) = \Sigma_C - 2\kappa g^\top + \kappa\kappa^\top s_Y^2 = \Sigma_C - \frac{g g^\top}{s_Y^2}.
+\]
+Now condition the decomposition on the event $Y \in I_\beta$. Because $C_\perp$ is independent of $Y$, the conditioning only touches the $\kappa (Y - m_Y)$ term, and mean/covariance of the two independent pieces add:
+\[
+\E[C \mid Y \in I_\beta] = m_C + \kappa\, \E[Y - m_Y \mid I_\beta] + 0
+= m_C + \kappa\, \tau_1,
+\]
+\[
+\Cov[C \mid Y \in I_\beta] = \kappa \kappa^\top\, \Var(Y \mid I_\beta) + \Cov(C_\perp),
+\]
+i.e.
 \begin{equation}
 \boxed{\;
 \mu_{\alpha \to \beta} = m_C + \frac{g}{s_Y^2}\, \tau_1, \qquad
 \Sigma_{\alpha \to \beta}
-= \underbrace{\Sigma_C - \frac{g g^\top}{s_Y^2}}_{\text{cov.\ given exact } Y}
-+ \underbrace{\frac{g g^\top}{s_Y^4}\,(\tau_2 - \tau_1^2)}_{\text{re-add } Y\text{'s in-bin spread}} .
+= \Sigma_C - \frac{g g^\top}{s_Y^2}
++ \frac{g g^\top}{s_Y^4}\,(\tau_2 - \tau_1^2) .
 \;}
 \label{eq:condition}
 \end{equation}
-Degenerate branch $s_Y^2 \approx 0$: $Y_\alpha$ is the constant $m_Y$, so it lands wholly in the bin containing $m_Y$, with $\mu_{\alpha\to\beta} = m_C$ and $\Sigma_{\alpha\to\beta} = \Sigma_C$ (no division by $s_Y^2$).
+
+There is a small degenerate case to deal with. When $s_Y^2 \approx 0$: $Y_\alpha$ is the constant $m_Y$, so it lands wholly in the bin containing $m_Y$, with $\mu_{\alpha\to\beta} = m_C$ and $\Sigma_{\alpha\to\beta} = \Sigma_C$ (no division by $s_Y^2$).
 
 \subsection{Mixture over old bins}
 Several old bins feed each new bin $\beta$; they combine with the posterior weights~\eqref{eq:bayes} by the laws of total mean and total covariance:
@@ -173,9 +188,6 @@ v^+_\beta = \sum_\alpha \eta_{\alpha\mid\beta}\, \E[Y_\alpha \mid I_\beta]
 + (\mu_{\alpha\to\beta} - \mu^+_\beta)(\mu_{\alpha\to\beta} - \mu^+_\beta)^\top \Big].
 \label{eq:merge}
 \end{equation}
-The outer-product term is the between-component spread. Note $v^+_\beta$ is the \emph{dynamic} conditional mean $\E[A^+ \mid A^+ \in I_\beta]$, not a fixed bin center. Finally $p^+$ is renormalized (logging the tail mass lost) and $\Sigma^+$ is symmetrized and PSD-clipped (logging any clip); both corrections are $\sim 10^{-16}$ in practice.
-
-\paragraph{Cost.} The only $O(n^3)$ work is $\Sigma_C = V \Sigma_\alpha V^\top$, once per old bin; everything else is $O(m^2 d + m d^2)$ per layer. The implementation never forms an $(m, m, d, d)$ tensor: it stores the $\beta$-independent part $\Sigma_C - g g^\top / s_Y^2$ once per $\alpha$ and re-adds the rank-one $g g^\top$ term per new bin. Total: $O(m\,n^3)$ per linear layer.
 
 \section{ReLU step}
 \label{sec:relu}
@@ -183,12 +195,31 @@ The outer-product term is the between-component spread. Note $v^+_\beta$ is the 
 ReLU is coordinatewise, so it respects the split~\eqref{eq:split}: $\relu(X) = \relu(A)\, e + \relu(B)$.
 
 \subsection{Bulk, inside each bin}
+\textbf{TLDR: Calculating the mean and covariance of the ReLU-ed Gaussian within each bin. Note this is $O(n^2)$.}
+
 With $B \sim \N(\mu_\alpha, \Sigma_\alpha)$, $\sigma_i^2 = \Sigma_{\alpha, ii}$, $z_i = \mu_i / \sigma_i$, the exact rectified-Gaussian marginal moments are
 \[
 \E[\relu(B_i)] = \mu_i \Phi(z_i) + \sigma_i \varphi(z_i), \qquad
 \E[\relu(B_i)^2] = (\mu_i^2 + \sigma_i^2)\Phi(z_i) + \mu_i \sigma_i \varphi(z_i),
 \]
-giving $\tilde\mu_{\alpha,i} = \E[\relu(B_i)]$ and $\tilde\Sigma_{\alpha, ii} = \E[\relu(B_i)^2] - \tilde\mu_{\alpha,i}^2$. Off-diagonal entries (default backend \texttt{"exact"}) use the exact bivariate-Gaussian ReLU covariance $\Cov(\relu(B_i), \relu(B_j))$ via Owen's~$T$; the cheaper \texttt{"gain"} backend uses the leading-order $\tilde\Sigma_{ij} = \Phi(z_i)\Phi(z_j)\, \Sigma_{ij}$; \texttt{"kprop"} delegates to the ordinary harmonic-kprop ReLU (which also enables per-bin propagation at general $k_{\max} > 2$).
+giving $\tilde\mu_{\alpha,i} = \E[\relu(B_i)]$ and $\tilde\Sigma_{\alpha, ii} = \E[\relu(B_i)^2] - \tilde\mu_{\alpha,i}^2$. Off-diagonal entries use the exact bivariate-Gaussian ReLU covariance $\Cov(\relu(B_i), \relu(B_j))$ via Owen's~$T$. 
+With correlation $\theta = \Sigma_{\alpha,ij} / (\sigma_i \sigma_j)$, $s = \sqrt{1 - \theta^2}$, and
+\[
+P = \Phi_2(z_i, z_j; \theta), \qquad
+q = \varphi_2(z_i, z_j; \theta), \qquad
+a_i = \varphi(z_i)\, \Phi\!\Big( \frac{z_j - \theta z_i}{s} \Big), \qquad
+a_j = \varphi(z_j)\, \Phi\!\Big( \frac{z_i - \theta z_j}{s} \Big),
+\]
+the closed form is
+\begin{equation}
+\E[\relu(B_i)\relu(B_j)]
+= \mu_i \mu_j P + \mu_j \sigma_i (a_i + \theta a_j) + \mu_i \sigma_j (a_j + \theta a_i)
++ \sigma_i \sigma_j \big[ \theta P + (1 - \theta^2)\, q - \theta z_i a_i - \theta z_j a_j \big],
+\label{eq:bvnrelu}
+\end{equation}
+Importantly, this depends only on the mean and covariance restricted to the $2$ coordinates, thus $O(1)$ to calculate.
+
+Implementation details: The backend choice \texttt{"kprop"} delegates to the ordinary harmonic-kprop ReLU.
 
 \subsection{Spike and bin merge}
 ReLU output is nonnegative, so the representatives map $\tilde v_\alpha = \max(v_\alpha, 0)$ onto a \emph{nonnegative} post-activation grid with a dedicated zero bin. Old bins landing in the same post bin $\beta$, $S_\beta = \{\alpha : \operatorname{bin}(\tilde v_\alpha) = \beta\}$, merge by mixture moments with $\eta_{\alpha\mid\beta} = p_\alpha / p^+_\beta$:
@@ -199,7 +230,9 @@ v^+_\beta = \sum_{\alpha \in S_\beta} \eta_{\alpha\mid\beta}\, \tilde v_\alpha, 
 \Sigma^+_\beta = \sum_{\alpha \in S_\beta} \eta_{\alpha\mid\beta} \big[ \tilde\Sigma_\alpha
 + (\tilde\mu_\alpha - \mu^+_\beta)(\tilde\mu_\alpha - \mu^+_\beta)^\top \big].
 \end{equation}
-Typically all bins with $v_\alpha \le 0$ collapse into the zero bin --- that is the post-ReLU mass atom at $0$.
+This bin is a bit special when trying to generalize to the assumption of mean and covariance being linear in $e_1$ direction, because it combines a pile of previously normal bins.
+Thus we always track the $0$ bin separately. 
+
 
 \section{Readout and recovered moments}
 
@@ -216,17 +249,15 @@ and the output mean is $W_{\mathrm{ro}}\, \E[X] + b_{\mathrm{ro}}$. The full cov
 \noindent\textbf{Algorithm 1:} \textsc{binned-kprop} ($K = 2$, $m$ spike bins)
 \vspace{4pt}\hrule\vspace{4pt}
 \begin{enumerate}\setlength{\itemsep}{1pt}
-\item Build pre-activation edges (with negative bins) and post-ReLU edges (nonnegative, zero bin).
 \item $(p, v, \mu, \Sigma) \gets$ \textsc{GaussianInitialState}$(d, \text{edges})$: truncated-normal $p_\alpha, v_\alpha$; $\mu = 0$, $\Sigma = I_d$.
 \item For each hidden layer with matrix $M = \begin{pmatrix} \gamma & r^\top \\ u & V \end{pmatrix}$ and bias:
   \begin{enumerate}\setlength{\itemsep}{1pt}
   \item \textbf{Linear step:} for each old bin $\alpha$ compute $(m_Y, s_Y^2, m_C, \Sigma_C, g)$ by \eqref{eq:jointYC};
   \item transition kernel $Q_{\beta\alpha}$, masses $p^+ = Qp$, posteriors $\eta_{\alpha\mid\beta}$ \hfill (eq.~\eqref{eq:bayes})
   \item condition the bulk on $Y \in I_\beta$: $(\mu_{\alpha\to\beta}, \Sigma_{\alpha\to\beta})$ \hfill (eq.~\eqref{eq:condition})
-  \item merge over old bins: $(v^+, \mu^+, \Sigma^+)$ \hfill (eqs.~\eqref{eq:vplus}--\eqref{eq:merge})
-  \item renormalize $p^+$; symmetrize/PSD-clip $\Sigma^+$;
+  \item find new bins and merge over old bins: $(v^+, \mu^+, \Sigma^+)$ \hfill (eqs.~\eqref{eq:vplus}--\eqref{eq:merge})
   \item \textbf{ReLU step:} per bin, exact rectified-Gaussian bulk update $(\tilde\mu_\alpha, \tilde\Sigma_\alpha)$; $\tilde v_\alpha = \max(v_\alpha, 0)$;
-  \item re-bin $\tilde v$ on the post grid and merge coincident bins by mixture moments.
+  \item combine negative bins at $0$ bin. 
   \end{enumerate}
 \item Return $W_{\mathrm{ro}} \big( \bar A\, e + \bar B \big) + b_{\mathrm{ro}}$ with $\bar A = \sum_\alpha p_\alpha v_\alpha$, $\bar B = \sum_\alpha p_\alpha \mu_\alpha$.
 \end{enumerate}
@@ -235,19 +266,18 @@ and the output mean is $W_{\mathrm{ro}}\, \E[X] + b_{\mathrm{ro}}$. The full cov
 
 \section{Bin placement by Wasserstein-2 quantization}
 \label{sec:w2}
-
-\subsection{The right error to minimize}
-Binning replaces the continuous law of $A$ by the $m$-atom law $\widehat A = \sum_\alpha p_\alpha \delta_{v_\alpha}$. Within a cell every value of $A$ is reported as $v_\alpha$, so the squared error introduced in the spike direction is
+\subsection{Minimizing mean difference}
+Binning replaces the continuous law of $A$ by the $m$-atom law $\widehat A = \sum_\alpha p_\alpha \delta_{v_\alpha}$. Within a cell every value of $A$ is reported as $v_\alpha$, so the squared error between the true and binned mean is
 \begin{equation}
 \sum_\alpha \int_{\text{cell } \alpha} (a - v_\alpha)^2 f(a)\, da
 = \sum_\alpha p_\alpha \Var(A \mid \text{cell } \alpha)
 = W_2^2\big( \law(A),\, \widehat{\law}(A) \big),
 \label{eq:w2}
 \end{equation}
-the squared Wasserstein-2 distance between the true continuous $A$ and its binned version (the nearest-representative coupling is optimal). ``Choose the bins well'' therefore \emph{means} ``minimize $W_2$ to the expected continuous distribution of $A$'': \eqref{eq:w2} is exactly the in-bin variance the linear step's representative collapse throws away.
+as there are no closed form objective, for choosing the bins, to minimize the algorithm's prediction error, I imagine choosing the bins to minimize the distance between 2 distributions to be a good enough surrogate. Empirically error tends to stabilize after around $o(n)$ bins regardless of how I chose the bins. 
 
 \subsection{Lloyd--Max optimality conditions}
-Minimizing \eqref{eq:w2} over both partition and representatives yields the two stationarity conditions of optimal scalar quantization: (i) representatives are cell centroids, $v_\alpha = \E[A \mid \text{cell } \alpha]$; (ii) edges are midpoints of adjacent representatives, $z_\alpha = \tfrac12 (v_\alpha + v_{\alpha+1})$. Condition (i) is what the propagation already uses everywhere (all the conditional means of Sections~3--5). Condition (ii) is what a fixed equal-mass quantile grid does \emph{not} satisfy. Alternating (i) and (ii) is Lloyd's algorithm; for log-concave densities (Gaussian, rectified Gaussian) it converges to the global optimum.
+Minimizing \eqref{eq:w2} over both partition and representatives yields the two stationarity conditions of optimal scalar quantization: (i) representatives are cell centroids, $v_\alpha = \E[A \mid \text{cell } \alpha]$; (ii) edges are midpoints of adjacent representatives, $z_\alpha = \tfrac12 (v_\alpha + v_{\alpha+1})$. Alternating (i) and (ii) is Lloyd's algorithm; for log-concave densities (Gaussian) it converges to the global optimum.
 
 \subsection{The exact per-layer law of $A$ is a Gaussian mixture}
 Under the $K=2$ closure the expected continuous law of the next spike coordinate is available in closed form, and that is what gets quantized:
@@ -257,64 +287,16 @@ Under the $K=2$ closure the expected continuous law of the next spike coordinate
 \law(A^+) = \sum_\alpha p_\alpha\, \N\big( m_{Y,\alpha},\, s_{Y,\alpha}^2 \big),
 \qquad m_{Y,\alpha} = \gamma v_\alpha + r^\top \mu_\alpha, \quad s_{Y,\alpha}^2 = r^\top \Sigma_\alpha r.
 \]
-The cell centroid of a mixture is closed form (no quadrature): with $\alpha_k = (a - m_k)/s_k$, $\beta_k = (b - m_k)/s_k$,
+The cell centroid of a mixture is closed form: with $\alpha_k = (a - m_k)/s_k$, $\beta_k = (b - m_k)/s_k$,
 \[
 \E\big[A^+ \mid [a, b)\big]
 = \frac{\sum_k w_k \big[ m_k (\Phi(\beta_k) - \Phi(\alpha_k)) + s_k (\varphi(\alpha_k) - \varphi(\beta_k)) \big]}
        {\sum_k w_k (\Phi(\beta_k) - \Phi(\alpha_k))}.
 \]
 This coincides with the linear step's representative $v^+_\beta$ in \eqref{eq:vplus}, so the propagated per-bin value is the \emph{exact mixture centroid}, never a single-Gaussian approximation.
-\item \textbf{Post-ReLU grid.} $A_{\mathrm{post}} = \max(A_{\mathrm{pre}}, 0)$ is the rectified mixture: an atom at $0$ of mass $\sum_k w_k \Phi(-m_k / s_k)$ plus a truncated positive tail. Its $W_2$-optimal quantizer pins one representative on the $0$-atom and Lloyd--Max points on the tail.
+\item \textbf{Post-activation grid.} Same bins as pre-activation, but the negative bins all merge at $0$.
 \end{itemize}
 Two grid builders exist: \texttt{lloyd\_max\_edges} (single moment-matched Gaussian, cheap) and \texttt{lloyd\_max\_edges\_mixture} (the true mixture, closed-form centroids each iteration). On a 3-component test the mixture version cut $W_2^2$ to the true law by 14--28\% over the moment-matched one.
-
-\subsection{$W_2$-optimal versus equal-mass quantiles}
-Equal-mass quantiles place point density $\propto f$; the squared-error optimum places density $\propto f^{1/3}$ (Panter--Dite high-rate quantization), i.e.\ more resolution in the tails --- exactly where the amplified spike coordinate carries the mass that ReLU treats asymmetrically. Measured $W_2^2$ distortion for $\N(0,1)$:
-
-\begin{center}
-\begin{tabular}{rcccc}
-\toprule
-$m$ & equal-mass & Lloyd--Max & reduction & extreme reps (equal-mass $\to$ $W_2$) \\
-\midrule
-5  & $1.03 \times 10^{-1}$ & $7.99 \times 10^{-2}$ & 22\% & \\
-9  & $4.70 \times 10^{-2}$ & $2.79 \times 10^{-2}$ & 41\% & $\pm 1.70 \to \pm 2.25$ \\
-15 & $2.42 \times 10^{-2}$ & $1.07 \times 10^{-2}$ & 56\% & $\to \pm 2.68$ \\
-31 & $9.59 \times 10^{-3}$ & $2.70 \times 10^{-3}$ & 72\% & $\to \pm 3.17$ \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Both decay as $W_2^2 \sim C/m^2$ (spike-discretization RMS error $\sim 1/m$); Lloyd--Max has the smaller constant, and the gap widens with $m$. In the current implementation the representatives are already $W_2$-optimal (they are conditional means throughout), while default \emph{edges} are equal-mass quantiles built once and reused; per-layer Lloyd--Max re-gridding of the exact mixture is available as a drop-in and only changes the edges. A practical caveat: past $\approx$ 4--7 bins accuracy is limited by the bulk $K=2$ closure, not the spike discretization, so $W_2$-optimal binning mainly reaches the same floor with \emph{fewer} bins (most useful in the few-bin / deeper-net regime).
-
-\section{Error sources and the width scaling law}
-
-\subsection{Error budget}
-Three approximations enter:
-\begin{enumerate}
-\item \textbf{Spike discretization} --- within-bin collapse of $A$; equals $W_2^2(\law(A), \widehat{\law}(A))$ by \eqref{eq:w2}; decays as $1/m^2$ and is minimized by Section~\ref{sec:w2}. At least one negative bin is required (a single $(-\infty, 0)$ catch-bin suffices); dropping negatives entirely costs 30--60\% error.
-\item \textbf{Bulk $K=2$ Gaussian closure} --- $B \mid \text{bin}$ treated as Gaussian. This is the dominant, width-dependent floor: relative $\mathrm{MSE} \sim n^{-2}$, the budget rate.
-\item \textbf{Mixture re-Gaussianization} --- refitting the mixture \eqref{eq:merge} as one Gaussian per bin.
-\end{enumerate}
-
-\subsection{Measured scaling}
-A budget-$k_{\max}$ predictor has output error $O(n^{-k_{\max}})$, so at $K = 2$ the relative $\mathrm{MSE} \sim n^{-2}$ (RMS $\sim n^{-1}$). Representing the spike coordinate with enough bins is exactly what recovers this rate; the naive $m = 1$ closure (collapse $A$ to its mean and eat the ReLU Jensen gap) only reaches $n^{-1}$. Seed-averaged over random coordinate-spiked nets, depth 2, $m = 31$:
-
-\begin{center}
-\begin{tabular}{rccc}
-\toprule
-$n$ & MSE (binned) & MSE ($m{=}1$) & RMS advantage \\
-\midrule
-32  & $2.5 \times 10^{-4}$ & $9.7 \times 10^{-2}$ & $19.5\times$ \\
-64  & $6.9 \times 10^{-5}$ & $4.2 \times 10^{-2}$ & $24.8\times$ \\
-128 & $1.9 \times 10^{-5}$ & $1.7 \times 10^{-2}$ & $30.2\times$ \\
-\midrule
-fit & $\mathrm{MSE} \sim n^{-1.88}$ & $\mathrm{MSE} \sim n^{-1.25}$ & \\
-    & ($\approx n^{-2}$, the $K{=}2$ rate) & ($\approx n^{-1}$, naive) & \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-Enough bins are needed to see the $n^{-2}$ rate: with too few, the spike-discretization error floors the total and flattens the slope. The fixed-width refinement curve shows error dropping sharply with $m$ and then converging to the bulk-closure floor; pushing \emph{below} that floor requires higher bulk cumulant order (the $K > 2$ hook propagates conditional cumulant tensors per bin through ordinary harmonic kprop), not finer spike bins.
 
 \appendix
 \section{Closed forms used}
@@ -334,5 +316,7 @@ P(Y \le 0) = \Phi(-z).
 \section{Implementation map}
 
 The $K=2$ core (\texttt{Mecha\_preds/binned\_kprop/core.py}) is numpy/scipy and torch-free: \texttt{BinnedK2State}, \texttt{gaussian\_initial\_state}, \texttt{linear\_step\_k2}, \texttt{relu\_step\_k2}, \texttt{run\_binned\_kprop\_k2}, \texttt{unconditional\_mean[\_cov]}; Gaussian-ReLU integrals come from the shared kernel \texttt{Mecha\_preds/\_utils}. Grid builders live in \texttt{binning.py} (\texttt{make\_gaussian\_edges}, \texttt{make\_relu\_post\_edges}, \texttt{lloyd\_max\_edges[\_mixture][\_split]}). \texttt{kprop\_hook.py} bridges to ordinary harmonic kprop for the \texttt{"kprop"} bulk-ReLU backend and the $K > 2$ per-bin tower. \texttt{adapter.py} provides the drop-in \texttt{run\_binned\_kprop(model, config=\{"num\_bins": m\})}; \texttt{selftest.py}, \texttt{scaling.py}, \texttt{benchmark.py} verify against Monte Carlo, check the $n^{-2}$ law, and tune $m$ respectively.
+
+\href{https://github.com/Tewoto1/Output-estimation-for-one-trained-model.git}{implementation in /Mecha\_preds/binned\_kprop}
 
 \end{document}

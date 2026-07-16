@@ -65,7 +65,9 @@ def width_scaling(widths: Sequence[int] = (32, 64, 128), *, depth: int = 2,
             Ws = coordinate_spike_net(n, depth, seed=s, theta=theta, out_dim=out_dim)
             mc, se = mc_output_mean(Ws, n, samples, batch, seed=1000 + s)
             eb.append(_rel(run_binned_kprop_k2(Ws, n, num_bins=num_bins, grid=grid, bulk_relu=bulk_relu)["mean"], mc))
-            es.append(_rel(run_binned_kprop_k2(Ws, n, num_bins=1, bulk_relu=bulk_relu)["mean"], mc))
+            # the naive single-Gaussian-spike baseline: PIN grid="fixed" (one all-reals bin;
+            # the driver default is now the W2-adaptive grid, which would split at 0)
+            es.append(_rel(run_binned_kprop_k2(Ws, n, num_bins=1, grid="fixed", bulk_relu=bulk_relu)["mean"], mc))
             nz.append(float(np.linalg.norm(se) / (np.linalg.norm(mc) + 1e-30)))
         rms_binned.append(float(np.mean(eb)))
         rms_single.append(float(np.mean(es)))
@@ -88,15 +90,20 @@ def width_scaling(widths: Sequence[int] = (32, 64, 128), *, depth: int = 2,
 def bin_refinement(n: int = 64, *, depth: int = 2, seeds: Sequence[int] = (10, 11, 12),
                    num_bins_list: Sequence[int] = (1, 3, 7, 15, 31),
                    samples: int = 1_500_000, batch: int = 250_000, theta: float = 1.0,
-                   out_dim: int = 8, bulk_relu: str = "exact") -> Dict[str, np.ndarray]:
-    """Fixed-width error vs ``num_bins`` (seed-averaged): the refinement curve."""
+                   out_dim: int = 8, bulk_relu: str = "exact",
+                   grid: str = "fixed") -> Dict[str, np.ndarray]:
+    """Fixed-width error vs ``num_bins`` (seed-averaged): the refinement curve.
+
+    ``grid="fixed"`` by default so the ``num_bins=1`` point stays the naive
+    single-Gaussian-spike closure the gates were calibrated on."""
     errs = []
     for nb in num_bins_list:
         e = []
         for s in seeds:
             Ws = coordinate_spike_net(n, depth, seed=s, theta=theta, out_dim=out_dim)
             mc, _se = mc_output_mean(Ws, n, samples, batch, seed=2000 + s)
-            e.append(_rel(run_binned_kprop_k2(Ws, n, num_bins=nb, bulk_relu=bulk_relu)["mean"], mc))
+            e.append(_rel(run_binned_kprop_k2(Ws, n, num_bins=nb, grid=grid,
+                                              bulk_relu=bulk_relu)["mean"], mc))
         errs.append(float(np.mean(e)))
     return {"num_bins": np.array(num_bins_list, dtype=float), "err": np.array(errs)}
 

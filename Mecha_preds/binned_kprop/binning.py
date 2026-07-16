@@ -180,6 +180,20 @@ def safe_bin_representative(edges: np.ndarray, beta: int) -> float:
     return 0.5 * (lo + hi)
 
 
+def ensure_zero_edge(edges: np.ndarray, *, tol: float = 0.0) -> np.ndarray:
+    """Return ``edges`` with an edge EXACTLY at 0, inserting one if absent.
+
+    The ReLU step classifies whole bins by the sign of their representative and
+    collapses the nonpositive ones into the zero atom EXACTLY -- that is only exact
+    when no bin straddles 0. Grids from ``lloyd_max_edges_mixture_split`` /
+    ``make_cells`` already split at 0; this guards fixed / user-supplied grids
+    (e.g. ``make_gaussian_edges`` with an odd ``num_bins``)."""
+    edges = np.asarray(edges, dtype=np.float64)
+    if np.any(np.abs(edges) <= tol):
+        return edges
+    return np.sort(np.append(edges, 0.0))
+
+
 def make_gaussian_edges(num_bins: int, *, std: float = 1.0,
                         tail_inf: bool = True) -> np.ndarray:
     """Pre-activation bin edges (length ``num_bins+1``) for a reference ``N(0, std^2)``.

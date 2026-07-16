@@ -29,6 +29,7 @@ from .binning import (
     normal_interval_stats,
     find_bin,
     safe_bin_representative,
+    ensure_zero_edge,
     make_gaussian_edges,
     make_relu_post_edges,
     lloyd_max_edges,
@@ -43,6 +44,7 @@ from .core import (
     gaussian_initial_state,
     linear_step_k2,
     relu_step_k2,
+    adaptive_neg_bins,
     unconditional_mean,
     unconditional_mean_cov,
     run_binned_kprop_k2,
@@ -67,10 +69,11 @@ from .empirical_structure import (
 __all__ = [
     # K=2 core
     "BinnedK2State", "normal_interval_stats", "find_bin", "safe_bin_representative",
-    "symmetrize", "project_to_psd", "make_gaussian_edges", "make_relu_post_edges",
+    "symmetrize", "project_to_psd", "ensure_zero_edge",
+    "make_gaussian_edges", "make_relu_post_edges",
     "lloyd_max_edges", "lloyd_max_edges_mixture", "lloyd_max_edges_mixture_split",
     "gaussian_initial_state",
-    "linear_step_k2", "relu_step_k2",
+    "linear_step_k2", "relu_step_k2", "adaptive_neg_bins",
     "unconditional_mean", "unconditional_mean_cov", "run_binned_kprop_k2", "resolve_workers",
     "SPIKE_COORD",
     # MLP adapter

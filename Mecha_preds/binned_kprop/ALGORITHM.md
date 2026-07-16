@@ -151,23 +151,30 @@ is the **exact bivariate-Gaussian** covariance `Cov(ρ(B_i),ρ(B_j))` via Owen's
 (`_utils.exact_relu_covariance`); the cheaper `"gain"` backend uses the leading-order
 `Σ̃_{ij}=Φ(z_i)Φ(z_j)\,Σ_{ij}`; `"kprop"` delegates to the ordinary harmonic kprop ReLU.
 
-### 5.2 Spike + merge
-ReLU output is nonnegative, so the spike representatives map `ṽ_α=\max(v_α,0)` onto a **nonnegative**
-post-grid with a zero bin. Old bins landing in the same post bin `β`, `S_β=\{\alpha:\text{bin}(ṽ_α)=\beta\}`,
-merge by mixture moments (`η_{α|β}=p_α/p^+_β`):
+### 5.2 Spike: keep positives verbatim, collapse negatives — NO re-binning
+The pre-activation grid always has an edge at 0, so every bin is entirely signed. ReLU is the
+**identity** on positive bins: `(p_α, v_α)` pass through untouched (only the bulk gets 5.1). Every
+nonpositive bin maps to exactly 0 — those bins are *coincident* and merge **exactly** into the single
+zero atom, `S_0={α: v_α≤0}`, `η_{α|0}=p_α/p^+_0`:
 
-$$p^+_\beta=\sum_{\alpha\in S_\beta}p_\alpha,\quad
-v^+_\beta=\sum_{\alpha\in S_\beta}\eta_{\alpha\mid\beta}\,ṽ_\alpha,\quad
-\mu^+_\beta=\sum\eta_{\alpha\mid\beta}\,\tilde\mu_\alpha,\quad
-\Sigma^+_\beta=\sum\eta_{\alpha\mid\beta}\big[\tilde\Sigma_\alpha+(\tilde\mu_\alpha-\mu^+_\beta)(\cdot)^\top\big].$$
+$$p^+_0=\sum_{\alpha\in S_0}p_\alpha,\quad
+v^+_0=0,\quad
+\mu^+_0=\sum\eta_{\alpha\mid 0}\,\tilde\mu_\alpha,\quad
+\Sigma^+_0=\sum\eta_{\alpha\mid 0}\big[\tilde\Sigma_\alpha+(\tilde\mu_\alpha-\mu^+_0)(\cdot)^\top\big].$$
 
-Typically *all* bins with `v_α≤0` collapse into the zero bin — that is the post-ReLU mass atom at 0 (§7.4).
+The post-ReLU state is `[zero atom] + [every positive bin, verbatim]`.
+
+**Removed (2026-07): the post-ReLU re-bin.** The old third step mapped `ṽ_α=max(v_α,0)` onto a fresh
+nonnegative post-grid and merged whatever landed together. Re-binning a discrete law can never add
+resolution, and it MERGED distinct positive bins — throwing away exactly the information the linear
+step had just resolved, layer after layer. The only genuine coincidence after ReLU is the zero atom;
+merging it is all that survives of that step.
 
 ---
 
 ## 6. Readout and recovering moments
 
-A full network alternates `linear_step` (pre-edges) and `relu_step` (post-edges) over the hidden layers;
+A full network alternates `linear_step` (pre-edges, split at 0) and `relu_step` (grid-free) over the hidden layers;
 the readout is linear (no ReLU). After the last hidden ReLU, reconstruct the full mean
 
 $$E[X]=\bar A\,e+\bar B,\qquad \bar A=\sum_\alpha p_\alpha v_\alpha,\quad \bar B=\sum_\alpha p_\alpha\mu_\alpha,$$
@@ -232,13 +239,20 @@ At each layer the closure gives `A`'s expected continuous law in closed form, an
   (since `η_{α|β}=p_α Q_{βα}/p^+_β` and `Q_{βα}` is component `α`'s mass in the cell). So in the
   propagation the per-bin expected value is the **exact mixture centroid**, never a single-Gaussian
   approximation.
-- **Post-ReLU grid:** `A_{\text{post}}=\max(A_{\text{pre}},0)` is the **rectified mixture** — an atom at 0
-  of mass `∑_k w_k Φ(−m_k/s_k)` plus a positive truncated mixture tail. Its `W₂`-optimal quantizer puts
-  **one representative on the 0-atom** and Lloyd–Max points on the positive tail.
+- **Sign split + the surviving budget (no post grid):** the pre grid is built split at 0
+  (`lloyd_max_edges_mixture_split`). ReLU keeps ONLY the positive bins — everything else collapses into
+  the zero atom — so the positive count is the only resolution that survives a layer. The positive side
+  always gets the FULL budget `num_bins`; the negative side gets the **mass-matched**
+  `m₋ = ceil(num_bins · p_{≤0}/p_{>0})` bins (same mass-per-bin both sides; `p_{≤0}=∑_k w_k Φ(−m_k/s_k)`
+  closed form; ≥1; capped at `8·num_bins` for the near-dead regime). Budget 20 at 50% positive → 40 bins
+  pre-ReLU → 20 + atom after; at 75% positive → 27 pre → 20 + atom. **The surviving count never
+  dilutes.** There is no post-ReLU grid at all: the rectified mixture's 0-atom is represented exactly by
+  the §5.2 merge and its positive part is already carried bin-by-bin — re-quantizing it can only lose
+  information.
 
 Two grid builders: `lloyd_max_edges(mean, std, num_bins, rectified=…)` Lloyd-Maxes a single
-moment-matched Gaussian (cheap, unimodal), while `lloyd_max_edges_mixture(weights, means, stds,
-num_bins, rectified=…)` Lloyd-Maxes the **true mixture** using the closed-form centroid above — every
+moment-matched Gaussian (cheap, unimodal), while `lloyd_max_edges_mixture[_split](weights, means, stds,
+…)` Lloyd-Maxes the **true mixture** using the closed-form centroid above — every
 iteration closed form, no quadrature. On a 3-component test the mixture version cut `W₂²` to the true
 law by 14–28% vs the moment-matched one.
 
@@ -260,17 +274,13 @@ constant `C`, and the gap widens with `m`.
 
 ### 7.5 Relation to the implementation
 - **Representatives** are already `W₂`-optimal everywhere (conditional means in §3–§5).
-- **Default edges** are equal-mass quantiles (`make_gaussian_edges` / `make_relu_post_edges`) — simple and
-  guaranteed non-empty (good for the transition kernel), but not `W₂`-optimal.
-- **`W₂`-optimal edges** are available via `lloyd_max_edges` (single moment-matched Gaussian) and
-  `lloyd_max_edges_mixture` (the exact mixture, closed-form centroids) — both: centroid reps + midpoint
-  edges, with the 0-atom pinned for the rectified/post case. Verified: interior edges equal the midpoints
-  of adjacent reps, the single-Gaussian distortions match the table above, and the mixture version is
-  exact for the true `A⁺` law.
-- **Note** these are grid *utilities*; the propagation loop currently still builds equal-mass quantile
-  grids once and reuses them. Wiring a per-layer `lloyd_max_edges_mixture` re-grid (the spike mixture is
-  rebuilt from `(p, m_Y, s_Y)` each layer) is the principled "dynamic `W₂` binning" — and since the
-  representatives are *already* exact mixture centroids, only the edges would change.
+- **Default (`grid="wasserstein"`):** per-layer re-grid of the exact spike mixture, split at 0, positive
+  side pinned to the full `num_bins` budget, negative side mass-adaptive (§7.3; `adaptive_neg_bins`,
+  override `num_bins_pre_neg`, cap `max_bins_neg`). Since the representatives are already exact mixture
+  centroids, only the edges change per layer.
+- **Legacy (`grid="fixed"`):** equal-mass quantiles (`make_gaussian_edges`, 0 edge inserted via
+  `ensure_zero_edge`) built once and reused — simple, but the positive side only gets whatever the static
+  grid puts right of 0 (~`num_bins/2`); kept for ablations/baselines.
 
 A practical caveat from the width experiments: past ≈ 4–7 bins the predictor's accuracy is limited by the
 **bulk `K=2` Gaussian closure**, not by the spike discretization, so `W₂`-optimal binning mainly lets you

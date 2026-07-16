@@ -28,26 +28,32 @@ from .core import run_binned_kprop_k2, SPIKE_COORD
 
 
 def default_binned_kprop_config() -> dict:
-    """Binned-kprop knobs. ``num_bins`` = number of spike bins (the hyperparameter);
-    ``num_bins_post`` sizes the post-ReLU grid (default = ``num_bins``); ``bulk_relu``
+    """Binned-kprop knobs. ``num_bins`` = the POSITIVE-side spike-bin budget (the
+    hyperparameter; the ReLU keeps exactly these bins + the zero atom -- no post-ReLU
+    re-binning exists anymore). ``grid="wasserstein"`` (default) rebuilds the
+    pre-activation grid per layer, split at 0, with a MASS-ADAPTIVE negative side
+    (``num_bins_pre_neg=None``; cap ``max_bins_neg``, default ``8 * num_bins``);
+    ``grid="fixed"`` is the legacy static Gaussian-quantile grid. ``bulk_relu``
     is the per-bin bulk-ReLU backend ('exact' = exact bivariate covariance, 'gain' =
     leading-order spec-8.2 gain, 'kprop' = delegate to harmonic kprop); ``input_std``
     is the Gaussian input scale; ``workers`` is the per-bin thread count -- ``"auto"``
     (default) parallelizes per machine (CUDA box -> 8, else min(8, cpu_count); env override
-    ``BINNED_KPROP_WORKERS``), pass ``1`` for serial."""
-    return {"num_bins": 21, "num_bins_post": None,
-            "num_bins_pre_pos": None, "num_bins_pre_neg": None,
+    ``BINNED_KPROP_WORKERS``), pass ``1`` for serial. (``num_bins_post`` in old cached
+    configs is tolerated and ignored.)"""
+    return {"num_bins": 21,
+            "num_bins_pre_pos": None, "num_bins_pre_neg": None, "max_bins_neg": None,
             "bulk_relu": "exact", "input_std": 1.0,
-            "grid": "fixed", "relu_merge": "post", "workers": "auto"}
+            "grid": "wasserstein", "relu_merge": "post", "workers": "auto"}
 
 
 def config_summary(config: Optional[dict] = None) -> str:
     c = default_binned_kprop_config()
     if config:
         c.update(config)
-    npost = c["num_bins_post"] if c["num_bins_post"] is not None else c["num_bins"]
-    return (f"BINNED-KPROP(K=2, num_bins={c['num_bins']}, post={npost}, "
-            f"grid={c.get('grid', 'fixed')}, bulk_relu={c['bulk_relu']}, "
+    nneg = c.get("num_bins_pre_neg")
+    return (f"BINNED-KPROP(K=2, num_bins={c['num_bins']}, "
+            f"neg={'adaptive' if nneg is None else nneg}, "
+            f"grid={c.get('grid', 'wasserstein')}, bulk_relu={c['bulk_relu']}, "
             f"workers={resolve_workers(c.get('workers', 'auto'))})")
 
 
@@ -68,10 +74,12 @@ def run_binned_kprop(model, input_dim: Optional[int] = None, config: Optional[di
                      spike_theta: float = 1.0, collect: bool = False) -> dict:
     """Predict ``E[model(X)]`` for ``X ~ N(0, I)`` by coordinate-spike binned kprop (K=2).
 
-    ``config`` keys: ``num_bins`` (the hyperparameter), ``num_bins_post``, ``bulk_relu``,
-    ``input_std``, and (``grid="wasserstein"`` only) ``num_bins_pre_pos`` / ``num_bins_pre_neg``
-    -- the positive / negative pre-activation bin budgets (defaults ``num_bins_post`` / ``num_bins``;
-    grow the positive side so ReLU, which keeps only positive bins, does not lose resolution).
+    ``config`` keys: ``num_bins`` (the positive-side budget -- THE hyperparameter),
+    ``bulk_relu``, ``input_std``, and (``grid="wasserstein"`` only) ``num_bins_pre_pos``
+    / ``num_bins_pre_neg`` / ``max_bins_neg`` -- positive override (default = ``num_bins``),
+    negative override (default = mass-adaptive: same mass-per-bin as the positive side),
+    and the adaptive cap (default ``8 * num_bins``). ReLU keeps every positive bin verbatim
+    and merges the negatives into the zero atom; there is no post grid.
     ``add_spike=True`` adds ``spike_theta * e_{spike_coord} e^T`` to each
     square hidden matrix (use when the spike is not already in the stored weights).
     Returns ``{"mean", "metadata", ...}``.
@@ -79,6 +87,7 @@ def run_binned_kprop(model, input_dim: Optional[int] = None, config: Optional[di
     cfg = default_binned_kprop_config()
     if config:
         cfg.update(config)
+    cfg.pop("num_bins_post", None)                     # legacy key in old cached configs
     if model.cfg.activation != "relu":
         raise ValueError(f"binned kprop supports ReLU only; got {model.cfg.activation!r}")
     if input_dim is None:
@@ -99,10 +108,11 @@ def run_binned_kprop(model, input_dim: Optional[int] = None, config: Optional[di
             weights[li] = (W, _b)
 
     res = run_binned_kprop_k2(
-        weights, input_dim, num_bins=int(cfg["num_bins"]), grid=str(cfg.get("grid", "fixed")),
-        num_bins_post=(None if cfg["num_bins_post"] is None else int(cfg["num_bins_post"])),
+        weights, input_dim, num_bins=int(cfg["num_bins"]),
+        grid=str(cfg.get("grid", "wasserstein")),
         num_bins_pre_pos=(None if cfg.get("num_bins_pre_pos") is None else int(cfg["num_bins_pre_pos"])),
         num_bins_pre_neg=(None if cfg.get("num_bins_pre_neg") is None else int(cfg["num_bins_pre_neg"])),
+        max_bins_neg=(None if cfg.get("max_bins_neg") is None else int(cfg["max_bins_neg"])),
         input_std=float(cfg["input_std"]), bulk_relu=str(cfg["bulk_relu"]),
         relu_merge=str(cfg.get("relu_merge", "post")),
         workers=cfg.get("workers", "auto"),

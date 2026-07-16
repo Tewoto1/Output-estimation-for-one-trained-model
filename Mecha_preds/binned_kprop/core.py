@@ -56,7 +56,7 @@ from .binning import (
     _VAR_FLOOR, _DEFAULT_MIN_PROB,
     Workers, resolve_workers, _run_bins,
     normal_interval_stats, find_bin, safe_bin_representative,
-    make_gaussian_edges, make_relu_post_edges,
+    ensure_zero_edge, make_gaussian_edges, make_relu_post_edges,
     lloyd_max_edges, lloyd_max_edges_mixture, lloyd_max_edges_mixture_split,
 )
 
@@ -286,96 +286,110 @@ def linear_step_k2(state: BinnedK2State, M: np.ndarray, edges: np.ndarray, *,
 # --------------------------------------------------------------------------- #
 # ReLU step  (spec sections 8-9)
 # --------------------------------------------------------------------------- #
-def relu_step_k2(state: BinnedK2State, post_edges: np.ndarray, *,
+_POST_EDGES_NOTICE = [False]
+
+
+def _post_edges_removed_notice(where: str) -> None:
+    if not _POST_EDGES_NOTICE[0]:
+        _POST_EDGES_NOTICE[0] = True
+        print(f"binned_kprop.{where}: post-ReLU re-binning was REMOVED (2026-07). The "
+              "passed post grid is ignored: positive bins now pass through ReLU exactly "
+              "and all nonpositive bins merge into the zero atom.")
+
+
+def relu_step_k2(state: BinnedK2State, post_edges: Optional[np.ndarray] = None, *,
                  min_prob: float = _DEFAULT_MIN_PROB, bulk_relu: str = "exact",
                  relu_merge: str = "post", workers: Workers = None,
                  stats: Optional[dict] = None) -> BinnedK2State:
-    """Propagate a binned K=2 state through coordinatewise ReLU.
+    """Propagate a binned K=2 state through coordinatewise ReLU. NO RE-BINNING.
 
-    Bulk: apply the K=2 ReLU covariance update (``bulk_relu`` backend). Spike: map each
-    representative ``v -> max(v, 0)``, assign to ``post_edges`` (nonnegative grid with a zero
-    bin), and MERGE old bins landing in the same new bin by mixture moments (spec 8.3 / 9).
+    ReLU is the identity on every positive spike value, so a positive bin passes
+    through UNCHANGED in ``(p, a)`` (only its bulk gets the K=2 ReLU update via the
+    ``bulk_relu`` backend). All nonpositive bins have ``max(a, 0) = 0``: they are
+    coincident after ReLU and merge EXACTLY into a single zero atom (spec 8.3 / 9,
+    mixture moments for the bulk). Output: ``[zero atom] + [positive bins, untouched]``
+    -- the positive-bin count is fully preserved.
 
-    ``relu_merge`` sets the order of the merge and the ReLU for bins sharing a post-bin
-    (mainly the zero bin, where all negative-spike bins collapse):
-      ``"post"`` (default, Strategy 1) -- ReLU each old bin's bulk, THEN merge the post-ReLU
-        moments. One exact-ReLU per OLD bin.
-      ``"pre"``  (Strategy 2) -- MERGE the old bins' pre-ReLU bulk into one Gaussian per
-        post-bin, THEN apply one exact-ReLU. One exact-ReLU per (occupied) POST-bin -- far
-        fewer of the expensive bivariate-ReLU calls when many bins merge (the zero bin).
-        Accuracy-neutral when the merged bins are ~bulk-exchangeable (the coordinate-spike
-        case: verified identical to ``"post"`` to ~1e-5 mean / 1e-3 cov).
+    The historical third step -- re-binning the ReLU output on a fresh nonnegative
+    ``post_edges`` grid -- was removed: it could only MERGE distinct positive bins
+    (a strict information loss compounding per layer) and never added resolution.
+    ``post_edges`` is accepted for backward compatibility and IGNORED (one printed
+    notice). The pre-activation grid must have an edge at 0 so no bin straddles the
+    kink (``ensure_zero_edge`` / the split grid builders guarantee this).
 
-    ``workers``: thread count for the independent per-bin loops. ``None``/``"auto"``
-    auto-resolves per machine; pass ``1`` for serial. Results match serial exactly.
+    ``relu_merge`` sets the order of merge and ReLU for the zero atom only:
+      ``"post"`` (default, Strategy 1) -- ReLU each nonpositive bin's bulk, THEN merge
+        the post-ReLU moments. One exact-ReLU per nonpositive bin.
+      ``"pre"``  (Strategy 2) -- MERGE the nonpositive bins' pre-ReLU bulk into one
+        Gaussian, THEN apply ONE exact-ReLU. Far fewer bivariate-ReLU calls;
+        accuracy-neutral when the merged bins are ~bulk-exchangeable.
+    Positive bins are singletons, so the strategies coincide there.
+
+    ``workers``: thread count for the independent per-bin bulk-ReLU calls.
+    ``None``/``"auto"`` auto-resolves per machine; ``1`` = serial (identical results).
     """
     if relu_merge not in ("post", "pre"):
         raise ValueError(f"relu_merge must be 'post' or 'pre', got {relu_merge!r}")
+    if post_edges is not None:
+        _post_edges_removed_notice("relu_step_k2")
     p, avals, mu, Sigma = state.p, state.a, state.mu, state.Sigma
     m_old = p.shape[0]
     d = mu.shape[1]
-    post_edges = np.asarray(post_edges, dtype=np.float64)
-    m_post = post_edges.shape[0] - 1
 
-    # map spike representatives through ReLU; assign old bins to post-bins (both strategies)
-    old_to_new = [find_bin(post_edges, max(float(avals[alpha]), 0.0)) for alpha in range(m_old)]
-    p_new_raw = np.zeros(m_post)
-    for alpha in range(m_old):
-        if p[alpha] > 0:
-            p_new_raw[old_to_new[alpha]] += p[alpha]
+    live = p > 0.0                                   # empty bins are dropped, not carried
+    pos_idx = np.nonzero(live & (avals > 0.0))[0]    # ReLU-invariant bins (kept verbatim)
+    neg_idx = np.nonzero(live & (avals <= 0.0))[0]   # coincident at 0 after ReLU (merged)
+    if pos_idx.size == 0 and neg_idx.size == 0:
+        raise RuntimeError("all spike-bin mass vanished in relu_step_k2")
 
-    a_new = np.zeros(m_post)
-    mu_new = np.zeros((m_post, d))
-    Sig_new = np.zeros((m_post, d, d))
+    # positive bins: spike untouched, bulk through the K=2 ReLU (one call per bin)
+    k_pos = pos_idx.size
+    mu_pos = np.zeros((k_pos, d)); Sig_pos = np.zeros((k_pos, d, d))
 
-    # Strategy 1: bulk-ReLU each old bin up front, then merge POST-ReLU moments.
-    a_bulk = Sig_bulk = None
-    if relu_merge == "post":
-        a_bulk = np.zeros((m_old, d)); Sig_bulk = np.zeros((m_old, d, d))
+    def _pos_bin(j):
+        alpha = pos_idx[j]
+        mu_pos[j], Sig_pos[j] = _bulk_relu_update(mu[alpha], Sigma[alpha], bulk_relu)
 
-        def _bulk_bin(alpha):
-            if p[alpha] > 0:
-                a_bulk[alpha], Sig_bulk[alpha] = _bulk_relu_update(mu[alpha], Sigma[alpha], bulk_relu)
+    _run_bins(k_pos, _pos_bin, workers)
 
-        _run_bins(m_old, _bulk_bin, workers)
+    # zero atom: exact merge of ALL nonpositive bins (mixture moments)
+    parts_p = [p[pos_idx]]; parts_a = [avals[pos_idx]]
+    parts_m = [mu_pos]; parts_S = [Sig_pos]
+    p0 = float(p[neg_idx].sum())
+    if p0 > 0.0:
+        eta = p[neg_idx] / p0
+        if relu_merge == "post":                     # Strategy 1: ReLU each, then merge
+            k_neg = neg_idx.size
+            mu_neg = np.zeros((k_neg, d)); Sig_neg = np.zeros((k_neg, d, d))
 
-    def _post_bin(beta):
-        if p_new_raw[beta] <= min_prob:
-            a_new[beta] = safe_bin_representative(post_edges, beta)
-            return
-        alphas = [a for a in range(m_old) if old_to_new[a] == beta and p[a] > 0]
-        eta = np.array([p[a] / p_new_raw[beta] for a in alphas])
-        a_new[beta] = float(sum(e * max(float(avals[a]), 0.0) for e, a in zip(eta, alphas)))
-        if relu_merge == "post":                      # mix POST-ReLU per-bin moments (Strategy 1)
-            mm = np.zeros(d)
-            for e, a in zip(eta, alphas):
-                mm += e * a_bulk[a]
-            S = np.zeros((d, d))
-            for e, a in zip(eta, alphas):
-                delta = a_bulk[a] - mm
-                S += e * (Sig_bulk[a] + np.outer(delta, delta))
-            mu_new[beta] = mm
-            Sig_new[beta] = symmetrize(S)
-        else:                                         # merge PRE-ReLU, then ONE ReLU (Strategy 2)
-            mu_pre = np.zeros(d)
-            for e, a in zip(eta, alphas):
-                mu_pre += e * mu[a]
-            S = np.zeros((d, d))
-            for e, a in zip(eta, alphas):
-                delta = mu[a] - mu_pre
-                S += e * (Sigma[a] + np.outer(delta, delta))
-            mu_new[beta], Sig_new[beta] = _bulk_relu_update(mu_pre, symmetrize(S), bulk_relu)
+            def _neg_bin(j):
+                alpha = neg_idx[j]
+                mu_neg[j], Sig_neg[j] = _bulk_relu_update(mu[alpha], Sigma[alpha], bulk_relu)
 
-    _run_bins(m_post, _post_bin, workers)
+            _run_bins(k_neg, _neg_bin, workers)
+            m0 = eta @ mu_neg
+            dm = mu_neg - m0[None, :]
+            S0 = (np.einsum("j,jab->ab", eta, Sig_neg, optimize=True)
+                  + np.einsum("j,ja,jb->ab", eta, dm, dm, optimize=True))
+        else:                                        # Strategy 2: merge pre-ReLU, ONE ReLU
+            mu_pre = eta @ mu[neg_idx]
+            dm = mu[neg_idx] - mu_pre[None, :]
+            S_pre = (np.einsum("j,jab->ab", eta, Sigma[neg_idx], optimize=True)
+                     + np.einsum("j,ja,jb->ab", eta, dm, dm, optimize=True))
+            m0, S0 = _bulk_relu_update(mu_pre, symmetrize(S_pre), bulk_relu)
+        parts_p.insert(0, np.array([p0])); parts_a.insert(0, np.array([0.0]))
+        parts_m.insert(0, m0[None, :]); parts_S.insert(0, symmetrize(S0)[None])
 
+    p_new_raw = np.concatenate(parts_p)
     total = p_new_raw.sum()
-    mass_lost = float(max(0.0, 1.0 - total))
     if total <= 0:
         raise RuntimeError("all spike-bin mass vanished in relu_step_k2")
-    p_new = p_new_raw / total
-    if stats is not None:
-        stats.setdefault("relu_mass_lost", []).append(mass_lost)
-    return BinnedK2State(p=p_new, a=a_new, mu=mu_new, Sigma=Sig_new)
+    if stats is not None:                            # nothing can escape now; kept for logs
+        stats.setdefault("relu_mass_lost", []).append(float(max(0.0, 1.0 - total)))
+    return BinnedK2State(p=p_new_raw / total,
+                         a=np.concatenate(parts_a),
+                         mu=np.concatenate(parts_m, axis=0),
+                         Sigma=np.concatenate(parts_S, axis=0))
 
 
 # --------------------------------------------------------------------------- #
@@ -435,46 +449,65 @@ def _spike_mixture(state: BinnedK2State, M: np.ndarray
     return state.p, m_Y, s_Y
 
 
+def adaptive_neg_bins(num_pos: int, neg_mass: float, *,
+                      max_bins_neg: Optional[int] = None) -> int:
+    """MASS-ADAPTIVE negative-bin count: same mass-per-bin as the positive side.
+
+    The positive side always gets its FULL ``num_pos`` budget (ReLU keeps only
+    positive bins, so that is the resolution that survives); the negative side gets
+    ``ceil(num_pos * neg_mass / pos_mass)`` bins -- e.g. 50% negative mass with a
+    20-bin budget -> 20 negative bins (40 total), 25% negative -> 7 (27 total). After
+    ReLU the negatives collapse into the single zero atom, leaving the ``num_pos``
+    positive bins + the atom: the bin count never dilutes across layers.
+
+    ``max_bins_neg`` (default ``8 * num_pos``) caps the count in the near-dead regime
+    (``neg_mass -> 1`` would otherwise blow up the grid; the merged zero atom gains
+    little from extra negative resolution there)."""
+    pos_mass = max(1.0 - float(neg_mass), 1e-12)
+    cap = (8 * num_pos) if max_bins_neg is None else int(max_bins_neg)
+    return int(np.clip(np.ceil(num_pos * float(neg_mass) / pos_mass), 1, max(1, cap)))
+
+
 def run_binned_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
-                        input_dim: int, num_bins: int, *, grid: str = "fixed",
+                        input_dim: int, num_bins: int, *, grid: str = "wasserstein",
                         pre_edges: Optional[np.ndarray] = None,
-                        post_edges: Optional[np.ndarray] = None,
-                        num_bins_post: Optional[int] = None,
                         num_bins_pre_pos: Optional[int] = None,
                         num_bins_pre_neg: Optional[int] = None,
+                        max_bins_neg: Optional[int] = None,
                         input_std: float = 1.0, bulk_relu: str = "exact",
                         relu_merge: str = "post",
                         min_prob: float = _DEFAULT_MIN_PROB,
                         workers: Workers = None,
-                        collect: bool = False) -> dict:
+                        collect: bool = False,
+                        post_edges: Optional[np.ndarray] = None,      # DEPRECATED, ignored
+                        num_bins_post: Optional[int] = None) -> dict:  # DEPRECATED, ignored
     """Predict ``E[f(X)]`` for ``X ~ N(0, input_std^2 I)`` by COORDINATE-SPIKE BINNED
     kprop (K=2) along ``e = e_1``.
 
     ``weights`` are ``(W, b)`` float64 pairs in forward order: the square ``n x n``
     hidden matrices ``M = W + e e^T`` (the spike is assumed already baked in -- pass the
     actual matrices), each followed by ReLU, then the linear readout (no ReLU).
-    ``num_bins`` is THE hyperparameter: the number of spike bins. ``num_bins_post``
-    (default = ``num_bins``) sizes the post-ReLU grid.
+    ``num_bins`` is THE hyperparameter: the POSITIVE-side spike-bin budget per layer.
 
-    ``grid`` selects the bin placement:
-      ``"fixed"`` (default) -- equal-mass Gaussian quantiles, built once and reused every layer
-        (``pre_edges`` includes negative bins; ``post_edges`` is nonnegative + a zero bin).
-      ``"wasserstein"`` -- per-layer DYNAMIC Lloyd-Max bins minimizing the Wasserstein-2 distance to
-        the layer's expected continuous spike law: the pre-activation grid Lloyd-Max-quantizes the
-        EXACT Gaussian mixture ``A^+ = sum_a p_a N(m_Y,a, s_Y,a^2)`` SPLIT AT 0 -- ``num_bins_pre_neg``
-        bins on the negatives, ``num_bins_pre_pos`` on the positives (see below) -- and the post-ReLU
-        grid quantizes the rectified mixture (0-atom pinned). ``pre_edges``/``post_edges`` are ignored
-        in this mode.
+    Each layer is: LINEAR (re-bin the exact Gaussian-mixture law of ``A^+`` on a grid
+    with an edge at 0) then ReLU (positive bins pass through UNTOUCHED; all nonpositive
+    bins merge exactly into the zero atom). There is NO post-ReLU re-binning -- the old
+    third step ("re-bin on a nonnegative post grid") could only merge distinct positive
+    bins and lost resolution every layer; it was removed. ``post_edges``/``num_bins_post``
+    are accepted for backward compatibility and IGNORED (one printed notice).
 
-    ``num_bins_pre_pos`` / ``num_bins_pre_neg`` (WASSERSTEIN grid only) size the pre-activation grid's
-    positive and negative halves. Because the ReLU keeps ONLY the positive pre-activation bins (every
-    negative bin collapses into the single zero bin), a symmetric ``num_bins`` grid would HALVE the
-    positive-bin count -- the only resolution that survives -- at every linear step. Pinning the
-    positive side to ``num_bins_pre_pos`` bins (default = ``num_bins_post``, so it fully feeds the post
-    grid) stops that collapse, while ``num_bins_pre_neg`` bins (default = ``num_bins``) keep resolving
-    the negative mass whose bulk law feeds the merged zero bin. The pre-activation grid thus GROWS to
-    ``num_bins_pre_neg + num_bins_pre_pos`` bins (defaults to ~2x ``num_bins``), concentrated where it
-    survives ReLU. Ignored for ``grid="fixed"``.
+    ``grid`` selects the pre-activation bin placement:
+      ``"wasserstein"`` (default) -- per-layer DYNAMIC Lloyd-Max bins minimizing the W2 distance
+        to the layer's exact Gaussian-mixture spike law ``A^+ = sum_a p_a N(m_Y,a, s_Y,a^2)``,
+        SPLIT AT 0: the positive side always gets the full ``num_bins`` budget
+        (override ``num_bins_pre_pos``); the negative side is MASS-ADAPTIVE --
+        ``ceil(num_bins * neg_mass / pos_mass)`` bins, same mass-per-bin as the positive side
+        (override ``num_bins_pre_neg``; capped at ``max_bins_neg``, default ``8 * num_bins``).
+        E.g. budget 20 at 50% positive -> 40 bins pre-ReLU, 20 + zero-atom after; at 75%
+        positive -> 27 pre, 20 + atom after. The surviving resolution never dilutes.
+      ``"fixed"`` (legacy) -- equal-mass Gaussian quantiles built once and reused every layer
+        (``pre_edges`` override; a 0 edge is inserted if absent). Positive resolution is
+        whatever the fixed grid puts right of 0 (~``num_bins/2``); kept for ablations.
 
     ``workers`` sets the per-bin thread count inside each linear/ReLU step. ``None``/``"auto"``
     (the default) auto-resolves per machine -- ``8`` on a CUDA box, else ``min(8, cpu_count)``,
@@ -490,31 +523,27 @@ def run_binned_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
         raise ValueError("num_bins must be >= 1")
     if grid not in ("fixed", "wasserstein"):
         raise ValueError(f"grid must be 'fixed' or 'wasserstein', got {grid!r}")
+    if post_edges is not None or num_bins_post is not None:
+        _post_edges_removed_notice("run_binned_kprop_k2")
     n_hidden = len(weights) - 1
     if n_hidden < 1:
         raise ValueError("need at least one hidden layer + a readout")
     d = input_dim - 1
-    if num_bins_post is None:
-        num_bins_post = num_bins
     if num_bins_pre_pos is None:                      # positive pre-activation bins (ReLU keeps these)
-        num_bins_pre_pos = num_bins_post              #   default: match the post grid it feeds
-    if num_bins_pre_neg is None:                      # negative pre-activation bins (feed the zero bin)
-        num_bins_pre_neg = num_bins
+        num_bins_pre_pos = num_bins                   #   the full budget, every layer
     dynamic = grid == "wasserstein"
     if dynamic:
         init_edges, _ = lloyd_max_edges(0.0, input_std, num_bins)   # W2-optimal N(0,std) over all reals
     else:
         if pre_edges is None:
             pre_edges = make_gaussian_edges(num_bins, std=input_std)
-        if post_edges is None:
-            post_edges = make_relu_post_edges(num_bins_post, std=input_std)
-        pre_edges = np.asarray(pre_edges, dtype=np.float64)
-        post_edges = np.asarray(post_edges, dtype=np.float64)
+        pre_edges = ensure_zero_edge(np.asarray(pre_edges, dtype=np.float64))
         init_edges = pre_edges
 
     stats: dict = {}
     state = gaussian_initial_state(d, init_edges, input_std=input_std)
     spike_by_layer = []
+    neg_bins_by_layer: List[int] = []
     for li in range(n_hidden):
         W, _b = weights[li]
         M = np.asarray(W, dtype=np.float64)
@@ -523,14 +552,20 @@ def run_binned_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
                              f"got {M.shape}")
         if dynamic:                                  # re-grid to the W2-optimal Lloyd-Max bins
             p_mix, m_Y, s_Y = _spike_mixture(state, M)
+            if num_bins_pre_neg is None:             # mass-adaptive negative side (see docstring)
+                neg_mass = float(np.sum(p_mix * _Phi(-m_Y / s_Y)))
+                n_neg = adaptive_neg_bins(num_bins_pre_pos, neg_mass,
+                                          max_bins_neg=max_bins_neg)
+            else:
+                n_neg = max(1, int(num_bins_pre_neg))
+            neg_bins_by_layer.append(n_neg)
             # pre-activation grid split at 0: pin the positive side (the only side ReLU keeps)
             layer_pre, _ = lloyd_max_edges_mixture_split(p_mix, m_Y, s_Y,
-                                                         num_bins_pre_neg, num_bins_pre_pos)
-            layer_post, _ = lloyd_max_edges_mixture(p_mix, m_Y, s_Y, num_bins_post, rectified=True)
+                                                         n_neg, num_bins_pre_pos)
         else:
-            layer_pre, layer_post = pre_edges, post_edges
+            layer_pre = pre_edges
         state = linear_step_k2(state, M, layer_pre, min_prob=min_prob, workers=workers, stats=stats)
-        state = relu_step_k2(state, layer_post, min_prob=min_prob, bulk_relu=bulk_relu,
+        state = relu_step_k2(state, min_prob=min_prob, bulk_relu=bulk_relu,
                              relu_merge=relu_merge,
                              workers=workers, stats=stats)
         if collect:
@@ -545,8 +580,11 @@ def run_binned_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]],
         "mean": np.asarray(mean, dtype=np.float64).reshape(-1),
         "metadata": {
             "predictor": "binned_kprop_k2", "K": 2, "num_bins": int(num_bins), "grid": grid,
-            "num_bins_post": int(num_bins_post), "n_hidden": n_hidden,
-            "num_bins_pre_pos": int(num_bins_pre_pos), "num_bins_pre_neg": int(num_bins_pre_neg),
+            "n_hidden": n_hidden,
+            "num_bins_pre_pos": int(num_bins_pre_pos),
+            "num_bins_pre_neg": ("adaptive" if num_bins_pre_neg is None
+                                 else int(num_bins_pre_neg)),
+            "neg_bins_by_layer": list(neg_bins_by_layer),
             "workers": resolve_workers(workers),
             "input_dim": int(input_dim), "bulk_relu": bulk_relu, "relu_merge": relu_merge,
             "output_dim": int(np.asarray(mean).reshape(-1).shape[0]),

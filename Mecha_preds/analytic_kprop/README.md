@@ -100,10 +100,13 @@ model, _ = MLP.load("checkpoints/spike_kprop/spike-e1_d3_w128_seed1_final.pt")
 pred = run_analytic_kprop(model, config={"num_nodes": 40})["mean"]
 ```
 
-Key knobs (`default_analytic_kprop_config`): `num_nodes` (total signed cells per
-layer — the hyperparameter; the §3 experiments show a knee at ~6–10, so 40 is
-generous), `num_nodes_neg`/`num_nodes_pos` (sign-split override; default allocates
-by mixture mass), `grid` (`"w2"` Lloyd-Max on the exact mixture | `"uniform"`),
+Key knobs (`default_analytic_kprop_config`): `num_nodes` (the POSITIVE-side cell
+budget per layer — the hyperparameter; ReLU keeps only positive cells, so the
+positive side always gets the full budget and the negative side is mass-adaptive,
+`ceil(num_nodes·neg/pos mass)` capped at `max_nodes_neg` = 8×budget — the surviving
+resolution never dilutes; the §3 experiments show a knee at ~6–10, so 40 is
+generous), `num_nodes_neg`/`num_nodes_pos` (sign-split override),
+`grid` (`"w2"` Lloyd-Max on the exact mixture | `"uniform"`),
 `bulk_relu` (`"exact"` | `"gain"` | `"kprop"`), `cov_intercept` (`"mc"` | `"ls"`),
 `diagnostics` (adds the per-cell `E_S` residual; costs `J` congruences/layer —
 torch-batched under `device`), `workers` (`"auto"` = parallel per-node ReLU, `1` =
@@ -112,9 +115,12 @@ serial; identical results; env `BINNED_KPROP_WORKERS`), `device` (`None` = numpy
 
 Experiments + validation: `experiments/analytic_kprop/` — the notebook
 (`analytic_kprop_colab.ipynb`) for cheap validation/diagnostics,
-**`affine_r2_experiment.py`** for the per-layer weighted R² of the affine
-hypothesis (pre vs post, mean & cov, ± zero atom, 1−R² width scaling; no MC
-needed), and
+**`affine_r2_colab.ipynb`** (built by `build_affine_r2_notebook.py`; replaces the
+deleted `affine_r2_experiment.py`) for the per-layer weighted R² of the affine
+hypothesis (pre vs post, mean & cov, ± zero atom, 1−R² width scaling to n=1024,
+3–4 seeds, Colab-sized ~30–40 min on a T4; no MC needed; per-(width,seed) rows
+cached as `checkpoints/analytic_kprop/r2/r2v2_*.json` — v2 keys because
+`num_nodes` is the positive-side budget since 2026-07-15), and
 **`binning_scaling_experiment.py`** for the width-scaling law at A100 scale
 (widths up to 4096, 10 parallel seeds, split-half cross-MSE to beat the MC-noise
 floor; ARC-infra runnable via `c run [name] "experiments/analytic_kprop/

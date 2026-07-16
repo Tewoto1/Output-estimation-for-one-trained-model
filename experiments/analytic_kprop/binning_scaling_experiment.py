@@ -134,7 +134,11 @@ def parse_args() -> argparse.Namespace:
                    help="fit='post' only: keep the zero atom (merge of all negative "
                         "cells) as a separate EXACT component, or fold it into the "
                         "affine family (the linearity-includes-the-atom hypothesis)")
-    p.add_argument("--mc-samples", type=int, default=100_000_000)
+    p.add_argument("--mc-samples", type=int, default=100_000_000,
+                   help="MC budget at the LARGEST width; smaller widths get "
+                        "S ~ n^1.7 of it (see mc_samples_for)")
+    p.add_argument("--mc-min-samples", type=int, default=4_000_000,
+                   help="floor of the width-scaled MC budget")
     p.add_argument("--mc-batch", type=int, default=200_000)
     p.add_argument("--binned-bins", type=int, default=40)
     p.add_argument("--binned-max-width", type=int, default=1024,
@@ -277,29 +281,49 @@ def mc_parallelism(args, n, use_gpu):
     total = torch.cuda.get_device_properties(0).total_memory
     b = min(args.mc_batch, max(20_000, int(4e9 / (n * 8))))
     weights = args.depth * n * n + args.out_dim * n     # float64 weight stack
-    per_task = (3 * b * n + weights) * 8
-    return int(max(1, min(args.num_seeds, (0.7 * total) // per_task)))
+    # ~5 live batch buffers per task (randn out, matmul in/out, pre-relu z, temp)
+    # + per-STREAM cached blocks the allocator does not share -> budget 60%.
+    # (Observed: 3-buffer/70% estimate caused transient recoverable OOMs at n=512.)
+    per_task = (5 * b * n + weights) * 8
+    return int(max(1, min(args.num_seeds, (0.6 * total) // per_task)))
+
+
+def mc_samples_for(args, n):
+    """Width-scaled sample budget. The predictor's rel-MSE falls ~ n^-1.7 while the
+    relative MC noise floor is ~ 1/samples independent of n -- so a UNIFORM budget
+    massively oversamples the small widths (at n=16 the signal is ~500x above even
+    a 2M-sample floor). Keep noise/signal roughly constant with S ~ n^1.7, floored
+    at --mc-min-samples and capped at --mc-samples (which the LARGEST width gets)."""
+    frac = (n / max(args.widths)) ** 1.7
+    lo = min(args.mc_min_samples, args.mc_samples)
+    return int(np.clip(args.mc_samples * frac, lo, args.mc_samples))
 
 
 def mc_reference(args, n, seed, use_gpu):
-    """Cached MC mean + s.e. + independent HALF means (for split-half cross-MSE)."""
-    key = (f"mc2_d{args.depth}_w{n}_seed{seed}_th{args.theta:g}"
-           f"_od{args.out_dim}_s{args.mc_samples}.npz")
-    path = os.path.join(CKPT_DIR, key)
-    if os.path.exists(path):
-        z = np.load(path)
-        # validate the halves (guards against files from before the >=2-batch fix)
-        if "cntA" in z.files and int(z["cntA"]) > 0 and int(z["cntB"]) > 0:
-            return z["mu"], z["se"], z["muA"], z["muB"]
-        print(f"  [mc] n={n} seed={seed}: cached file lacks valid halves -> recomputing", flush=True)
+    """Cached MC mean + s.e. + independent HALF means (for split-half cross-MSE).
+    Accepts a cache computed at ANY budget >= this width's scaled budget (more
+    samples never hurt), so pre-existing uniform-100M files keep being reused."""
+    samples = mc_samples_for(args, n)
+    def _key(s):
+        return os.path.join(CKPT_DIR, f"mc2_d{args.depth}_w{n}_seed{seed}"
+                                      f"_th{args.theta:g}_od{args.out_dim}_s{s}.npz")
+    for s in sorted({samples, args.mc_samples}, reverse=True):   # prefer the biggest
+        path = _key(s)
+        if os.path.exists(path):
+            z = np.load(path)
+            # validate the halves (guards against files from before the >=2-batch fix)
+            if "cntA" in z.files and int(z["cntA"]) > 0 and int(z["cntB"]) > 0:
+                return z["mu"], z["se"], z["muA"], z["muB"]
+            print(f"  [mc] n={n} seed={seed}: cached file lacks valid halves -> recomputing",
+                  flush=True)
     Ws = coordinate_spike_net(n, args.depth, seed, theta=args.theta, out_dim=args.out_dim)
     t0 = time.time()
     if use_gpu:
-        mu, se, muA, muB, cA, cB = _mc_halves_torch(Ws, n, args.mc_samples, args.mc_batch, 10_000 + seed)
+        mu, se, muA, muB, cA, cB = _mc_halves_torch(Ws, n, samples, args.mc_batch, 10_000 + seed)
     else:
-        mu, se, muA, muB, cA, cB = _mc_halves_numpy(Ws, n, args.mc_samples, args.mc_batch, 10_000 + seed)
-    np.savez(path, mu=mu, se=se, muA=muA, muB=muB, cntA=cA, cntB=cB)
-    print(f"  [mc] n={n} seed={seed}: {args.mc_samples:,} samples in {time.time()-t0:.1f}s "
+        mu, se, muA, muB, cA, cB = _mc_halves_numpy(Ws, n, samples, args.mc_batch, 10_000 + seed)
+    np.savez(_key(samples), mu=mu, se=se, muA=muA, muB=muB, cntA=cA, cntB=cB)
+    print(f"  [mc] n={n} seed={seed}: {samples:,} samples in {time.time()-t0:.1f}s "
           f"({'gpu' if use_gpu else 'cpu'})", flush=True)
     return mu, se, muA, muB
 
@@ -378,11 +402,23 @@ def main():
     points_path = os.path.join(results_dir, "points.jsonl")
 
     use_gpu = args.gpu_available
+    # LOUD gpu diagnostic: MC on CPU when the box has a GPU is a ~100x slowdown --
+    # if this says "cuda UNAVAILABLE", fix the torch wheel / driver before running.
+    try:
+        import torch
+        gpu_report = (f"cuda OK: {torch.cuda.get_device_name(0)}" if torch.cuda.is_available()
+                      else f"torch {torch.__version__} present but cuda UNAVAILABLE "
+                           f"(wheel/driver mismatch? check nvidia-smi)")
+    except Exception as e:
+        gpu_report = f"no torch ({e})"
     print(f"mode={'QUICK (no GPU detected; pass --full to override)' if args.quick else 'FULL'} "
-          f"| gpu={use_gpu}")
+          f"| gpu={use_gpu} | {gpu_report}", flush=True)
+    mc_sched = {n: mc_samples_for(args, n) for n in args.widths}
     print(f"widths={args.widths} seeds={args.seeds} num_nodes={args.num_nodes} "
-          f"depth={args.depth} MC={args.mc_samples:,} fit={args.fit} "
-          f"threads={args.threads} mem_gb={args.mem_gb:.0f}", flush=True)
+          f"depth={args.depth} fit={args.fit} threads={args.threads} "
+          f"mem_gb={args.mem_gb:.0f}", flush=True)
+    print("MC budget per width: " + "  ".join(f"{n}:{s/1e6:g}M" for n, s in mc_sched.items()),
+          flush=True)
     print(f"RESULTS_DIR={results_dir}", flush=True)
 
     all_points = []
@@ -429,6 +465,14 @@ def main():
                     "cross_mse_rel": float((pred - muA) @ (pred - muB)) / mu2,
                     "noise_rel2": noise_rel2,
                     "runtime_s": runtime, "cached": bool(cached),
+                    # raw vectors (out_dim floats each): make the synced results
+                    # SELF-CONTAINED -- any error metric can be recomputed later
+                    # without the instance's npz caches.
+                    "pred": [float(v) for v in pred],
+                    "mc_mu": [float(v) for v in mu],
+                    "mc_muA": [float(v) for v in muA],
+                    "mc_muB": [float(v) for v in muB],
+                    "mc_se": [float(v) for v in se],
                 })
             return rows
 
@@ -437,6 +481,18 @@ def main():
             for rows in ex.map(seed_task, args.seeds):
                 for r in rows:
                     emit(r)
+        # A width is self-contained: drop its MC refs / nets and return the GPU
+        # allocator's per-stream cached blocks (they fragment across widths --
+        # the source of the recoverable OOM warnings seen at n=512).
+        mcs.clear()
+        if use_gpu:
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        import gc
+        gc.collect()
         print(f"[width {n:5d}] done in {time.time()-t0:6.1f}s  "
               f"(outer={outer} seed-tasks x inner={inner} workers, "
               f"~{est_gb:.1f}GB/task, analytic device={ana_dev or 'numpy'})", flush=True)

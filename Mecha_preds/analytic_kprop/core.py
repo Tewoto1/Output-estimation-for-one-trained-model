@@ -218,18 +218,32 @@ def negative_mass(p: np.ndarray, mY: np.ndarray, sY2: np.ndarray) -> float:
 
 
 def split_node_budget(num_nodes: int, neg_mass: float,
-                      num_nodes_neg: Optional[int], num_nodes_pos: Optional[int]
-                      ) -> Tuple[int, int]:
-    """Allocate the ``num_nodes`` cell budget across the sign split, proportional to
-    the mixture mass on each side (>= 1 cell each side; overrides win)."""
-    if num_nodes_neg is not None and num_nodes_pos is not None:
-        return max(1, int(num_nodes_neg)), max(1, int(num_nodes_pos))
+                      num_nodes_neg: Optional[int], num_nodes_pos: Optional[int],
+                      *, max_nodes_neg: Optional[int] = None) -> Tuple[int, int]:
+    """Allocate the sign-split cell counts. The POSITIVE side always gets the FULL
+    ``num_nodes`` budget; the negative side is MASS-ADAPTIVE.
+
+    ReLU keeps only the positive cells as atoms (every nonpositive cell merges into
+    the zero atom), so the positive count is the only resolution that survives a
+    layer. The old rule split a fixed total ``num_nodes`` proportionally to the sign
+    masses, which silently DILUTED the surviving budget (50% negative mass -> only
+    ``num_nodes/2`` positive cells). Now:
+
+        n_pos = num_nodes                                (or ``num_nodes_pos``)
+        n_neg = ceil(n_pos * neg_mass / pos_mass)        (or ``num_nodes_neg``)
+
+    -- the negative side gets the same mass-per-cell as the positive side (e.g.
+    budget 20 at 50% negative -> 20 negative cells, 40 total; at 25% negative -> 7,
+    27 total), it collapses into the zero atom at the ReLU, and the surviving count
+    never dilutes. ``max_nodes_neg`` (default ``8 * n_pos``) caps the adaptive count
+    in the near-dead regime (``neg_mass -> 1``). Both sides are always >= 1."""
+    n_pos = max(1, int(num_nodes if num_nodes_pos is None else num_nodes_pos))
     if num_nodes_neg is not None:
-        return max(1, int(num_nodes_neg)), max(1, num_nodes - int(num_nodes_neg))
-    if num_nodes_pos is not None:
-        return max(1, num_nodes - int(num_nodes_pos)), max(1, int(num_nodes_pos))
-    n_neg = int(np.clip(round(num_nodes * neg_mass), 1, num_nodes - 1))
-    return n_neg, num_nodes - n_neg
+        return max(1, int(num_nodes_neg)), n_pos
+    pos_mass = max(1.0 - float(neg_mass), 1e-12)
+    cap = (8 * n_pos) if max_nodes_neg is None else int(max_nodes_neg)
+    n_neg = int(np.clip(np.ceil(n_pos * float(neg_mass) / pos_mass), 1, max(1, cap)))
+    return n_neg, n_pos
 
 
 def make_cells(p, mY, sY2, n_neg: int, n_pos: int, *, grid: str = "w2",
@@ -424,7 +438,8 @@ def _chol_ok(S: np.ndarray) -> bool:
 
 def analytic_layer_update(state: AnalyticState, M: np.ndarray, b: Optional[np.ndarray],
                           *, num_nodes: int, num_nodes_neg: Optional[int] = None,
-                          num_nodes_pos: Optional[int] = None, grid: str = "w2",
+                          num_nodes_pos: Optional[int] = None,
+                          max_nodes_neg: Optional[int] = None, grid: str = "w2",
                           bulk_relu: str = "exact", cov_intercept: str = "mc",
                           min_prob: float = _DEFAULT_MIN_PROB,
                           diagnostics: bool = False,
@@ -468,7 +483,8 @@ def analytic_layer_update(state: AnalyticState, M: np.ndarray, b: Optional[np.nd
 
     # ---- signed cell grid with an edge at 0 (checklist 2) ----
     n_neg, n_pos = split_node_budget(num_nodes, negative_mass(p_in, mY, sY2),
-                                     num_nodes_neg, num_nodes_pos)
+                                     num_nodes_neg, num_nodes_pos,
+                                     max_nodes_neg=max_nodes_neg)
     edges = make_cells(p_in, mY, sY2, n_neg, n_pos, grid=grid)
     _t = _phase("grid", _t)
 
@@ -629,6 +645,7 @@ def run_analytic_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]]
                           input_dim: int, num_nodes: int = 40, *,
                           num_nodes_neg: Optional[int] = None,
                           num_nodes_pos: Optional[int] = None,
+                          max_nodes_neg: Optional[int] = None,
                           grid: str = "w2", bulk_relu: str = "exact",
                           cov_intercept: str = "mc", input_std: float = 1.0,
                           min_prob: float = _DEFAULT_MIN_PROB,
@@ -641,11 +658,18 @@ def run_analytic_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]]
 
     ``weights`` are ``(W, b)`` float64 pairs in forward order (square ``n x n``
     hidden matrices with the spike baked in, each followed by ReLU, then the linear
-    readout). ``num_nodes`` is THE hyperparameter: the total number of signed scalar
-    quadrature cells per layer (allocated across the sign split proportionally to
-    mixture mass unless ``num_nodes_neg``/``num_nodes_pos`` override). The bulk
-    between layers is ONE affine family (2 vectors + 2 matrices), so the per-layer
-    congruence cost is O(1), not O(num_nodes) -- see module docstring.
+    readout). ``num_nodes`` is THE hyperparameter: the POSITIVE-side scalar cell
+    budget per layer. ReLU keeps only the positive cells as atoms (nonpositive cells
+    merge exactly into the zero atom), so the positive side always gets the FULL
+    budget; the negative side is MASS-ADAPTIVE -- ``ceil(num_nodes * neg/pos mass)``
+    cells, same mass-per-cell as the positive side, capped at ``max_nodes_neg``
+    (default ``8 * num_nodes``). E.g. budget 20 at 50% negative -> 40 cells total,
+    20 surviving; at 25% negative -> 27 total, 20 surviving: the resolution that
+    survives a layer never dilutes. (The old rule split a FIXED total across the
+    signs, silently halving the surviving budget at 50% negative mass.) Override
+    with ``num_nodes_neg``/``num_nodes_pos``. The bulk between layers is ONE affine
+    family (2 vectors + 2 matrices), so the per-layer congruence cost is O(1), not
+    O(num_nodes) -- see module docstring.
 
     ``workers`` threads the per-node Gaussian-ReLU loop exactly like the binned
     companion (``None``/``"auto"`` = auto-parallel per machine, ``1`` = serial;
@@ -667,8 +691,9 @@ def run_analytic_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]]
     Returns ``{"mean", "metadata", ...}``; ``collect`` adds per-layer affine states,
     the spike law by layer, the final state, and the raw stats lists.
     """
-    if num_nodes < 2:
-        raise ValueError("num_nodes must be >= 2 (need >= 1 cell on each side of 0)")
+    if num_nodes < 1:
+        raise ValueError("num_nodes must be >= 1 (the positive-side cell budget; the "
+                         "negative side gets its own mass-adaptive cells)")
     if fit not in ("pre", "post"):
         raise ValueError(f"fit must be 'pre' or 'post', got {fit!r}")
     n_hidden = len(weights) - 1
@@ -690,14 +715,16 @@ def run_analytic_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]]
         if fit == "post":
             state = analytic_layer_update_post(
                 state, M, b, num_nodes=num_nodes, num_nodes_neg=num_nodes_neg,
-                num_nodes_pos=num_nodes_pos, grid=grid, bulk_relu=bulk_relu,
+                num_nodes_pos=num_nodes_pos, max_nodes_neg=max_nodes_neg,
+                grid=grid, bulk_relu=bulk_relu,
                 cov_intercept=cov_intercept, atom=atom, min_prob=min_prob,
                 workers=workers, dev=dev, stats=stats)
             aff = state                                     # the state IS the family
         else:
             state, aff = analytic_layer_update(
                 state, M, b, num_nodes=num_nodes, num_nodes_neg=num_nodes_neg,
-                num_nodes_pos=num_nodes_pos, grid=grid, bulk_relu=bulk_relu,
+                num_nodes_pos=num_nodes_pos, max_nodes_neg=max_nodes_neg,
+                grid=grid, bulk_relu=bulk_relu,
                 cov_intercept=cov_intercept, min_prob=min_prob,
                 diagnostics=diagnostics, workers=workers, dev=dev, stats=stats)
         if collect:
@@ -732,6 +759,7 @@ def run_analytic_kprop_k2(weights: List[Tuple[np.ndarray, Optional[np.ndarray]]]
             "max_scalar_distortion": _mx("scalar_distortion"),
             "total_psd_clipped": float(sum(stats.get("psd_clipped", [0.0]))),
             "num_pos_nodes_by_layer": list(stats.get("num_pos_nodes", [])),
+            "num_cells_by_layer": list(stats.get("num_cells", [])),
         },
     }
     if diagnostics:
@@ -831,6 +859,7 @@ def analytic_layer_update_post(state: PostAffineState, M: np.ndarray,
                                b: Optional[np.ndarray], *, num_nodes: int,
                                num_nodes_neg: Optional[int] = None,
                                num_nodes_pos: Optional[int] = None,
+                               max_nodes_neg: Optional[int] = None,
                                grid: str = "w2", bulk_relu: str = "exact",
                                cov_intercept: str = "mc", atom: str = "exact",
                                min_prob: float = _DEFAULT_MIN_PROB,
@@ -889,7 +918,8 @@ def analytic_layer_update_post(state: PostAffineState, M: np.ndarray,
 
     # ---- grid + closed-form pair stats (same machinery as fit="pre") ----
     n_neg, n_pos = split_node_budget(num_nodes, negative_mass(p_in, mY, sY2),
-                                     num_nodes_neg, num_nodes_pos)
+                                     num_nodes_neg, num_nodes_pos,
+                                     max_nodes_neg=max_nodes_neg)
     edges = make_cells(p_in, mY, sY2, n_neg, n_pos, grid=grid)
     _t = _phase("grid", _t)
     Q, ymean, delta, vv, stoch = _pair_stats(p_in, mY, sY2, edges, min_prob=min_prob)

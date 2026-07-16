@@ -8,8 +8,9 @@ Drop-in like ``run_binned_kprop`` / ``run_spike_kprop``:
     pred  = run_analytic_kprop(model)["mean"]                        # 40 nodes (default)
     pred2 = run_analytic_kprop(model, config={"num_nodes": 80})["mean"]
 
-``num_nodes`` is the adjustable hyperparameter (total signed quadrature cells per
-layer). The coordinate spike acts on ``e_1`` (hidden coordinate 0); pass
+``num_nodes`` is the adjustable hyperparameter (the POSITIVE-side cell budget per
+layer; the negative side gets its own mass-adaptive cells and collapses into the
+zero atom at the ReLU). The coordinate spike acts on ``e_1`` (hidden coordinate 0); pass
 ``add_spike=True`` to ADD ``spike_theta * e_c e_c^T`` to each (square) hidden
 matrix when the stored weights do not already contain it. Requires square hidden
 layers (``input_dim == hidden_dim``), as the train-to-zero models satisfy.
@@ -26,18 +27,21 @@ from .core import run_analytic_kprop_k2, SPIKE_COORD
 
 
 def default_analytic_kprop_config() -> dict:
-    """Analytic-kprop knobs. ``num_nodes`` = total signed scalar quadrature cells per
-    layer (THE hyperparameter; split across the sign proportionally to mixture mass
-    unless ``num_nodes_neg``/``num_nodes_pos`` override); ``grid`` places the cells
-    ('w2' = Lloyd-Max on the exact scalar mixture, 'uniform' = equal width);
-    ``bulk_relu`` is the per-node Gaussian-ReLU backend ('exact' = exact bivariate
-    covariance, 'gain' = leading-order gain, 'kprop' = harmonic kprop, torch);
+    """Analytic-kprop knobs. ``num_nodes`` = the POSITIVE-side scalar cell budget per
+    layer (THE hyperparameter; ReLU keeps only positive cells, so the positive side
+    always gets the full budget and the negative side is MASS-ADAPTIVE --
+    ``ceil(num_nodes * neg/pos mass)`` cells, capped at ``max_nodes_neg`` (default
+    ``8 * num_nodes``); override via ``num_nodes_neg``/``num_nodes_pos``); ``grid``
+    places the cells ('w2' = Lloyd-Max on the exact scalar mixture, 'uniform' = equal
+    width); ``bulk_relu`` is the per-node Gaussian-ReLU backend ('exact' = exact
+    bivariate covariance, 'gain' = leading-order gain, 'kprop' = harmonic kprop, torch);
     ``cov_intercept`` = 'mc' (moment-conservative, paper eq 90) or 'ls';
     ``input_std`` is the Gaussian input scale; ``workers`` threads the per-node
     Gaussian-ReLU loop like binned_kprop ("auto" = parallel per machine, 1 = serial,
     identical results either way; env override ``BINNED_KPROP_WORKERS``); ``device``
     (e.g. "cuda") offloads the Sigma-stack congruences to torch (numpy fallback)."""
     return {"num_nodes": 40, "num_nodes_neg": None, "num_nodes_pos": None,
+            "max_nodes_neg": None,
             "grid": "w2", "bulk_relu": "exact", "cov_intercept": "mc",
             "fit": "pre", "atom": "exact",
             "input_std": 1.0, "diagnostics": False,
@@ -104,6 +108,7 @@ def run_analytic_kprop(model, input_dim: Optional[int] = None, config: Optional[
         weights, input_dim, num_nodes=int(cfg["num_nodes"]),
         num_nodes_neg=(None if cfg.get("num_nodes_neg") is None else int(cfg["num_nodes_neg"])),
         num_nodes_pos=(None if cfg.get("num_nodes_pos") is None else int(cfg["num_nodes_pos"])),
+        max_nodes_neg=(None if cfg.get("max_nodes_neg") is None else int(cfg["max_nodes_neg"])),
         grid=str(cfg["grid"]), bulk_relu=str(cfg["bulk_relu"]),
         cov_intercept=str(cfg["cov_intercept"]), input_std=float(cfg["input_std"]),
         fit=str(cfg.get("fit", "pre")), atom=str(cfg.get("atom", "exact")),

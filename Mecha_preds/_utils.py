@@ -221,6 +221,34 @@ def exact_relu_covariance(mu, Sigma, *, var_eps: float = _DEFAULT_VAR_EPS, neg_r
     return new_mu, new_Sigma
 
 
+def exact_relu_covariance_pairs(mu_i, mu_j, sig_i, sig_j, rho):
+    """Exact ``Cov(ReLU(Z_i), ReLU(Z_j))`` for SELECTED pairs, vectorized over any
+    broadcastable shapes (same closed form as :func:`exact_relu_covariance`, eq 24,
+    without materializing an ``n x n`` matrix -- use when you need a sparse subset
+    of pairs, e.g. sampled off-diagonal entries across a grid of conditioning values).
+
+    Stochastic, non-degenerate entries only: callers must guarantee ``sig > 0`` and
+    ``|rho|`` bounded away from 1 (bulk pairs have ``|rho| = O(1/sqrt(n))``); there is
+    no perfect-correlation / point-mass handling here. Validated against
+    ``exact_relu_covariance`` to ~1e-16 (see experiments/affine_conditional_layer1).
+    """
+    ai, aj = mu_i / sig_i, mu_j / sig_j
+    r = np.clip(rho, -1 + 1e-12, 1 - 1e-12)
+    s = np.sqrt(1.0 - r * r)
+    A = _phi(ai) * _Phi((aj - r * ai) / s)
+    B = _phi(aj) * _Phi((ai - r * aj) / s)
+    P = bvn_cdf(ai, aj, r)
+    D = _bvn_pdf(ai, aj, r)
+    M_i = A + r * B
+    M_j = B + r * A
+    M_ij = r * P + (1.0 - r * r) * D - r * ai * A - r * aj * B
+    Ecross = (mu_i * mu_j * P + mu_i * sig_j * M_j + mu_j * sig_i * M_i
+              + sig_i * sig_j * M_ij)
+    m_i = mu_i * _Phi(ai) + sig_i * _phi(ai)
+    m_j = mu_j * _Phi(aj) + sig_j * _phi(aj)
+    return Ecross - m_i * m_j
+
+
 # --------------------------------------------------------------------------- #
 # classic matrix utilities (symmetrize / PSD projection by eigenvalue clip)
 # --------------------------------------------------------------------------- #

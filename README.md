@@ -36,6 +36,11 @@ Mecha_preds/      mechanistic predictors
                     discretized only transiently into num_nodes closed-form quadrature
                     cells per layer (O(1) congruences/layer, not O(num_bins)). Spec:
                     writeups/analytic_affine_kprop.pdf; see Mecha_preds/analytic_kprop/README.md
+  simple_spikeprop/ SIMPLE SPIKE-PROP (same M=W+e₁e₁ᵀ class): bulk = ONE unconditional
+                    Gaussian (the CONST surrogate — no bins, no affine family); spike =
+                    full 1-d grid law via the exact channel recursion p'=φ_ω∗(c·ReLU+μ)_#p.
+                    No structural hyperparameter; the family's ablation floor (same n⁻²
+                    order, larger constant). See Mecha_preds/simple_spikeprop/README.md
 experiments/  generated notebooks + their build_*.py generators (+ shared _nb.py)
 utils.py          device / seeding / numpy helpers
 ```

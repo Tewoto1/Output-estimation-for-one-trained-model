@@ -17,4 +17,10 @@ sampling. Predictors shipped here:
         affine family ``N(mu0 + mu1 y, Sigma0 + Sigma1 y)``; the spike is quadratured
         transiently by ``num_nodes`` closed-form cells per layer
         (``run_analytic_kprop``; O(1) congruences per layer).
+  * ``Mecha_preds.simple_spikeprop`` -- SIMPLE SPIKE-PROP for the same coordinate
+        spike: the bulk is ONE unconditional Gaussian (the CONST surrogate -- no bins,
+        no affine family, no conditioning) and the spike a full 1-d grid law driven by
+        the exact channel recursion ``p' = phi_omega * (c ReLU + mu)_# p`` with
+        ``mu = w^T m``, ``omega^2 = w^T Sigma w`` off the tracked bulk
+        (``run_simple_spikeprop``; no structural hyperparameter -- the ablation floor).
 """

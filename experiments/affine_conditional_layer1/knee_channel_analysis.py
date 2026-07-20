@@ -161,9 +161,9 @@ if __name__ == "__main__":
         ax[0].plot(t, np.sqrt(n) * (c0["mcurve"] - wmean(c0["mcurve"], c0["p"])), "o-",
                    ms=3, label=f"n={n}")
         ax[1].plot(t, np.sqrt(n) * (c0["vcurve"] / c0["om2"] - 1), "o-", ms=3, label=f"n={n}")
-    ax[0].set_title(r"$\sqrt{n}\,\big(E[\xi|a]-\mu\big)$: the dropped mean structure"
-                    "\n(tilt $\\kappa a$ + old-knee leak, both $O(n^{-1/2})$ -> collapse)")
-    ax[1].set_title(r"$\sqrt{n}\,\big(\mathrm{Var}(\xi|a)/\omega^2-1\big)$: dropped variance tilt")
+    ax[0].set_title(r"$\sqrt{n}\,(E[\xi|a]-\mu)$: the dropped mean structure"
+                    "\n(tilt $\\kappa a$ + old-knee leak, both $O(n^{-1/2})$: collapse)")
+    ax[1].set_title(r"$\sqrt{n}\,(\mathrm{Var}(\xi|a)/\omega^2-1)$: dropped variance tilt")
     for a_ in ax:
         a_.set_xlabel(r"standardized source spike $a$"); a_.legend(fontsize=8); a_.grid(alpha=.3)
     fig.tight_layout(); fig.savefig(os.path.join(FIGD, "F9_channel_structure.png"), dpi=150)
@@ -181,11 +181,15 @@ if __name__ == "__main__":
     ax[0].set_xlabel("width n"); ax[0].set_ylabel(r"debiased $D^2=\int(p-\hat p_{\rm rec})^2$")
     ax[0].set_title("recursion marginal error: $D^2 \\propto 1/n$\n(amplitude $O(n^{-1/2})$)")
     ax[0].legend(fontsize=7); ax[0].grid(alpha=.3, which="both")
-    for key, lab, c in [("Pmean_12", r"$\|E[\xi|a]-\mu\|_p^2$ (mean structure)", "C0"),
+    for key, lab, c in [("Pmean_12", r"$\|E[\xi|a]-\mu\|_p^2$ (per seed: $\approx\kappa^2$Var$(a)$)", "C0"),
                         ("Pvar_rel_12", r"$\|\mathrm{Var}(\xi|a)/\omega^2-1\|_p^2$", "C1")]:
-        ax[1].loglog(ns, np.abs(agg(key)), "o-", color=c, label=lab)
+        for r in rows:
+            ax[1].loglog(r["n"], abs(r[key]), ".", color=c, ms=6)
+        ax[1].loglog(ns, np.abs(agg(key)), "-", color=c, label=lab, alpha=.7)
+    for r in rows:
+        ax[1].loglog(r["n"], r["skew_12"] ** 2, ".", color="C2", ms=6)
     ax[1].loglog(ns, np.array([np.mean([r["skew_12"] ** 2 for r in rows if r["n"] == n_])
-                               for n_ in ns]), "o-", color="C2", label=r"skew$(\xi)^2$")
+                               for n_ in ns]), "-", color="C2", label=r"skew$(\xi)^2$ ($\sim n^{-2}$: random-sign $w$)", alpha=.7)
     ax[1].loglog(ns, 1.0 / np.array(ns, float), ":", color="gray", label=r"$\propto 1/n$")
     ax[1].set_xlabel("width n"); ax[1].set_title("dropped-term powers, channel 1->2: all $\\propto 1/n$")
     ax[1].legend(fontsize=7); ax[1].grid(alpha=.3, which="both")
@@ -207,9 +211,9 @@ if __name__ == "__main__":
     ax.plot(ctr, ph, "C0", lw=1.6, label="MC marginal of $A_2$ (1M)")
     ax.plot(ctr, atom + branch, "k--", lw=1.2, label="closed form (3 scalars)")
     ax.fill_between(ctr, 0, atom, color="C3", alpha=.25,
-                    label=r"smeared atom $\frac12\,\varphi_\omega(a-\mu)$")
+                    label=r"smeared atom $\frac{1}{2}\varphi_\omega(a-\mu)$")
     ax.fill_between(ctr, 0, branch, color="C2", alpha=.2,
-                    label=r"branch $\varphi_{s_+}(u)\,\Phi\!\big(\frac{c\tau u}{\omega s_+}\big)$ (skew-normal)")
+                    label=r"branch $\varphi_{s_+}(u)\,\Phi(c\tau u/(\omega s_+))$ (skew-normal)")
     ax.set_title(f"layer-2 spike marginal, n=1024: closed form\n"
                  f"$\\tau$={tau:.2f}, c={cc:.2f}, $\\mu$={mu:+.2f}, $\\omega$={om:.2f}"
                  f"   (TV to MC = {r['tv_L2']:.3f})")
